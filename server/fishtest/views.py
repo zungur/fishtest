@@ -168,7 +168,7 @@ def signup(request):
     strong_password, err = password_strength(
         signup_password, signup_username, signup_email)
     if not strong_password:
-        errors.append(err)
+        errors.append("Weak password: "+err)
     if signup_password != signup_password_verify:
         errors.append("Matching verify password required")
     if "@" not in signup_email:
