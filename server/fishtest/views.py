@@ -353,18 +353,36 @@ def user(request):
             new_password_verify = request.params.get("password2", "")
             new_email = request.params.get("email")
 
-            strong_password, err = password_strength(
+            strong_password, weak_error = password_strength(
                 new_password, user_name, new_email)
-            if not strong_password:
-                request.session.flash("Weak password: "+err, "error")
-                return {"user": user_data, "profile": profile}
-            if new_password != new_password_verify:
-                request.session.flash("Matching verify password required", "error")
-                return {"user": user_data, "profile": profile}
-            user_data["password"] = new_password
+            
+            update_errors = list()
+            updated_fields = list()
 
-            if len(new_email) > 0:
-                user_data["email"] = new_email
+            if strong_password:
+                if new_password == new_password_verify:
+                    user_data["password"] = new_password
+                    updated_fields.append("Password")
+                else:
+                    update_errors.append("Matching verify password required")
+            else:
+                update_errors.append("Weak password: " + weak_error)
+
+            if (len(new_email) > 0) and ("@" in new_email) :
+                if (user_data["email"] != new_email):
+                    user_data["email"] = new_email
+                    updated_fields.append("Email")
+                else:
+                    update_errors.append("Email is unchanged")                
+            else:
+                update_errors.append("Email is required")
+
+            if len(update_errors) > 0:
+                request.session.flash("Update failed with following errors: " + err, "error") for err in update_errors
+            if len(update_status) > 0:
+                request.session.flash(field + "updated") for field in updated_fields
+
+
         else:
             user_data["blocked"] = "blocked" in request.POST
             request.userdb.last_pending_time = 0
@@ -378,7 +396,8 @@ def user(request):
                 + user_name
             )
         request.userdb.save_user(user_data)
-        return HTTPFound(location=request.route_url("tests"))
+        return {"user": user_data, "profile": profile}
+        # return HTTPFound(location=request.route_url("tests"))
     userc = request.userdb.user_cache.find_one({"username": user_name})
     hours = int(userc["cpu_hours"]) if userc is not None else 0
     return {
