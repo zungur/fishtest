@@ -349,15 +349,22 @@ def user(request):
     user_data = request.userdb.get_user(user_name)
     if "user" in request.POST:
         if profile:
-            if len(request.params.get("password")) > 0:
-                if request.params.get("password") != request.params.get(
-                    "password2", ""
-                ):
-                    request.session.flash("Matching verify password required", "error")
-                    return {"user": user_data, "profile": profile}
-                user_data["password"] = request.params.get("password")
-            if len(request.params.get("email")) > 0:
-                user_data["email"] = request.params.get("email")
+            new_password = request.params.get("password")
+            new_password_verify = request.params.get("password2", "")
+            new_email = request.params.get("email")
+
+            strong_password, err = password_strength(
+                new_password, user_name, new_email)
+            if not strong_password:
+                request.session.flash("Weak password: "+err, "error")
+                return {"user": user_data, "profile": profile}
+            if new_password != new_password_verify:
+                request.session.flash("Matching verify password required", "error")
+                return {"user": user_data, "profile": profile}
+            user_data["password"] = new_password
+
+            if len(new_email) > 0:
+                user_data["email"] = new_email
         else:
             user_data["blocked"] = "blocked" in request.POST
             request.userdb.last_pending_time = 0

@@ -29,7 +29,7 @@
       </div>
     </div>
     <div class="control-group">
-      <label class="control-label">Repeat password:</label>
+      <label class="control-label">Verify password:</label>
       <div class="controls">
         <input name="password2" type="password" required="required"/>
       </div>
