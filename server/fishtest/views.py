@@ -15,6 +15,7 @@ from fishtest.util import (
     delta_date,
     estimate_game_duration,
     format_results,
+    password_strength,
 )
 from pyramid.httpexceptions import HTTPFound, exception_response
 from pyramid.response import Response
@@ -164,8 +165,10 @@ def signup(request):
     signup_password_verify = request.POST.get("password2", "")
     signup_email = request.POST.get("email", "")
     
-    if len(signup_password) == 0:
-        errors.append("Non-empty password required")
+    strong_password, err = password_strength(
+        signup_password, signup_username, signup_email)
+    if not strong_password:
+        errors.append(err)
     if signup_password != signup_password_verify:
         errors.append("Matching verify password required")
     if "@" not in signup_email:
