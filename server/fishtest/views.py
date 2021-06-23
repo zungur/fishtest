@@ -358,12 +358,15 @@ def user(request):
                 if new_password != new_password_verify:
                     request.session.flash("Matching verify password required", "error")
                     return {"user": user_data, "profile": profile}                
+                
                 strong_password, password_err = password_strength(
                     new_password, user_name, user_data["email"],
                     (new_email if len(new_email) > 0 else None))
-                if not strong_password:
-                    request.session.flash("Weak password: " + password_err, "error")
-                    return {"user": user_data, "profile": profile}
+                
+                # if not strong_password:
+                #     request.session.flash("Weak password: " + password_err, "error")
+                #     return {"user": user_data, "profile": profile}
+                
                 user_data["password"] = new_password
                 request.session.flash("Password updated")
 
