@@ -337,11 +337,11 @@ def delta_date(diff):
     return delta
 
 
-def password_strength(password, username, email):
+def password_strength(password, *args):
     if len(password) > 0:
         # add given username and email to user_inputs
         # such that the chosen password isn't similar to either
-        password_analysis = zxcvbn(password, user_inputs=[username, email])
+        password_analysis = zxcvbn(password, user_inputs=[i for i in args])
         # strength scale: [0-weakest <-> 4-strongest]
         # values below 3 will give suggestions and an (optional) warning
         if password_analysis['score'] > 2:
