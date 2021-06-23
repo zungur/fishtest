@@ -168,15 +168,15 @@ def signup(request):
     strong_password, password_err = password_strength(
         signup_password, signup_username, signup_email)
     if not strong_password:
-        errors.append("Weak password: " + password_err)
+        errors.append("Error! Weak password: " + password_err)
     if signup_password != signup_password_verify:
-        errors.append("Matching verify password required")
+        errors.append("Error! Matching verify password required")
     if "@" not in signup_email:
-        errors.append("Email required")
+        errors.append("Error! Email required")
     if len(signup_username) == 0:
-        errors.append("Username required")
+        errors.append("Error! Username required")
     if not signup_username.isalnum():
-        errors.append("Alphanumeric username required")
+        errors.append("Error! Alphanumeric username required")
     if errors:
         for error in errors:
             request.session.flash(error, "error")
@@ -206,7 +206,7 @@ def signup(request):
         email = signup_email,
     )
     if not result:
-        request.session.flash("Invalid username", "error")
+        request.session.flash("Error! Invalid username or password", "error")
     else:
         request.session.flash(
             "Your account has been created, but will be activated by a human. This might take a few hours. Thank you for contributing!"
@@ -361,21 +361,21 @@ def user(request):
                         (new_email if len(new_email) > 0 else None))
                     if strong_password:
                         user_data["password"] = new_password
-                        request.session.flash("Password updated")
+                        request.session.flash("Success! Password updated")
                     else:
-                        request.session.flash("Weak password: " + password_err, "error")
+                        request.session.flash("Error! Weak password: " + password_err, "error")
                         return HTTPFound(location=request.route_url("tests"))
                 else:
-                    request.session.flash("Matching verify password required", "error")
+                    request.session.flash("Error! Matching verify password required", "error")
                     return HTTPFound(location=request.route_url("tests"))
 
             if len(new_email) > 0 and user_data["email"] != new_email:
                 if "@" not in new_email:
-                    request.session.flash("Valid email required", "error")
+                    request.session.flash("Error! Valid email required", "error")
                     return HTTPFound(location=request.route_url("tests"))
                 else:
                     user_data["email"] = new_email
-                    request.session.flash("Email updated")
+                    request.session.flash("Success! Email updated")
 
         else:
             user_data["blocked"] = "blocked" in request.POST
