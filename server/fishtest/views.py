@@ -350,60 +350,34 @@ def user(request):
     if "user" in request.POST:
         if profile:
 
-            # if len(request.params.get("password")) > 0:
-            #     if request.params.get("password") != request.params.get(
-            #         "password2", ""
-            #     ):
-            #         request.session.flash("Matching verify password required", "error")
-            #         return {"user": user_data, "profile": profile}
-            #     user_data["password"] = request.params.get("password")
-            # if len(request.params.get("email")) > 0:
-            #     user_data["email"] = request.params.get("email")
-
-
             new_password = request.params.get("password")
             new_password_verify = request.params.get("password2", "")
             new_email = request.params.get("email")    
 
             if len(new_password) > 0:
+                errors = []
+                strong_password, weak_error = password_strength(
+                    new_password, user_name, new_email)
+                if not strong_password:
+                    errors.append("Weak password: " + weak_password_errors)
                 if new_password != new_password_verify:
-                    request.session.flash("Matching verify password required", "error")
+                    errors.append("Matching verify password required")
+                
+                if errors:
+                    for error in errors:
+                        request.session.flash(error, "error")
                     return {"user": user_data, "profile": profile}
-                user_data["password"] = new_password
-            if len(new_email) > 0:
-                user_data["email"] = new_email
+                else:
+                    user_data["password"] = new_password
+                    request.session.flash("Password updated")
 
-
-            # errors = []
-            # updates = []
-
-            # new_password = request.params.get("password")
-            # new_password_verify = request.params.get("password2", "")
-            # new_email = request.params.get("email")
-
-            # strong_password, weak_error = password_strength(
-            #     new_password, user_name, new_email)
-            # if len(new_password) > 0 and not strong_password:
-            #     errors.append("Weak password: " + weak_password_errors)
-            # if new_password != new_password_verify:
-            #     errors.append("Matching verify password required")
-            # user_data["password"] = new_password
-            # updates.append("Password")
-            
-            # if user_data["email"] != new_email:
-            #     if "@" not in new_email:
-            #         errors.append("Valid email required")
-            #     user_data["email"] = new_email
-            #     updates.append("Email")
-
-            # if updates:
-            #     for update in updates:
-            #         request.session.flash(update + " updated")
-            #     return {}
-            # if errors:
-            #     for error in errors:
-            #         request.session.flash(error, "error")
-            #     return {"user": user_data, "profile": profile}
+            if len(new_email) > 0 and user_data["email"] != new_email:
+                if "@" not in new_email:
+                    request.session.flash("Valid email required", "error")
+                    return {"user": user_data, "profile": profile}
+                else:
+                    user_data["email"] = new_email
+                    request.session.flash("Email updated")
 
         else:
             user_data["blocked"] = "blocked" in request.POST
