@@ -350,28 +350,28 @@ def user(request):
     if "user" in request.POST:
         if profile:
 
-            if len(request.params.get("password")) > 0:
-                if request.params.get("password") != request.params.get(
-                    "password2", ""
-                ):
-                    request.session.flash("Matching verify password required", "error")
-                    return {"user": user_data, "profile": profile}
-                user_data["password"] = request.params.get("password")
-            if len(request.params.get("email")) > 0:
-                user_data["email"] = request.params.get("email")
-
-
-            # new_password = request.params.get("password")
-            # new_password_verify = request.params.get("password2", "")
-            # new_email = request.params.get("email")    
-
-            # if len(new_password) > 0:
-            #     if new_password != new_password_verify:
+            # if len(request.params.get("password")) > 0:
+            #     if request.params.get("password") != request.params.get(
+            #         "password2", ""
+            #     ):
             #         request.session.flash("Matching verify password required", "error")
             #         return {"user": user_data, "profile": profile}
-            #     user_data["password"] = new_password
-            # if len(new_email) > 0:
-            #     user_data["email"] = new_email
+            #     user_data["password"] = request.params.get("password")
+            # if len(request.params.get("email")) > 0:
+            #     user_data["email"] = request.params.get("email")
+
+
+            new_password = request.params.get("password")
+            new_password_verify = request.params.get("password2", "")
+            new_email = request.params.get("email")    
+
+            if len(new_password) > 0:
+                if new_password != new_password_verify:
+                    request.session.flash("Matching verify password required", "error")
+                    return {"user": user_data, "profile": profile}
+                user_data["password"] = new_password
+            if len(new_email) > 0:
+                user_data["email"] = new_email
 
 
             # errors = []
