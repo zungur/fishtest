@@ -367,12 +367,12 @@ def user(request):
                         return HTTPFound(location=request.route_url("tests"))
                 else:
                     request.session.flash("Matching verify password required", "error")
-                    return HTTPFound(location=request.route_url("user"))
+                    return HTTPFound(location=request.route_url("tests"))
 
             if len(new_email) > 0 and user_data["email"] != new_email:
                 if "@" not in new_email:
                     request.session.flash("Valid email required", "error")
-                    return HTTPFound(location=request.route_url("user"))
+                    return HTTPFound(location=request.route_url("tests"))
                 else:
                     user_data["email"] = new_email
                     request.session.flash("Email updated")
@@ -390,7 +390,7 @@ def user(request):
                 + user_name
             )
         request.userdb.save_user(user_data)
-        return HTTPFound(location=request.route_url("user"))
+        return HTTPFound(location=request.route_url("tests"))
     userc = request.userdb.user_cache.find_one({"username": user_name})
     hours = int(userc["cpu_hours"]) if userc is not None else 0
     return {
