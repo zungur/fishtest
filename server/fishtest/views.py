@@ -182,23 +182,23 @@ def signup(request):
             request.session.flash(error, "error")
         return {}
 
-    path = os.path.expanduser("~/fishtest.captcha.secret")
-    if os.path.exists(path):
-        with open(path, "r") as f:
-            secret = f.read()
-            payload = {
-                "secret": secret,
-                "response": request.POST.get("g-recaptcha-response", ""),
-                "remoteip": request.remote_addr,
-            }
-            response = requests.post(
-                "https://www.google.com/recaptcha/api/siteverify", data=payload
-            ).json()
-            if "success" not in response or not response["success"]:
-                if "error-codes" in response:
-                    print(response["error-codes"])
-                request.session.flash("Captcha failed", "error")
-                return {}
+    # path = os.path.expanduser("~/fishtest.captcha.secret")
+    # if os.path.exists(path):
+    #     with open(path, "r") as f:
+    #         secret = f.read()
+    #         payload = {
+    #             "secret": secret,
+    #             "response": request.POST.get("g-recaptcha-response", ""),
+    #             "remoteip": request.remote_addr,
+    #         }
+    #         response = requests.post(
+    #             "https://www.google.com/recaptcha/api/siteverify", data=payload
+    #         ).json()
+    #         if "success" not in response or not response["success"]:
+    #             if "error-codes" in response:
+    #                 print(response["error-codes"])
+    #             request.session.flash("Captcha failed", "error")
+    #             return {}
 
     result = request.userdb.create_user(
         username = signup_username,
@@ -349,39 +349,36 @@ def user(request):
     user_data = request.userdb.get_user(user_name)
     if "user" in request.POST:
         if profile:
+            errors = []
+            updates = []
+
             new_password = request.params.get("password")
             new_password_verify = request.params.get("password2", "")
             new_email = request.params.get("email")
 
             strong_password, weak_error = password_strength(
                 new_password, user_name, new_email)
+            if len(new_password) > 0 and not strong_password:
+                errors.append("Weak password: " + weak_password_errors)
+            if new_password != new_password_verify:
+                errors.append("Matching verify password required")
+            user_data["password"] = new_password
+            updates.append("Password")
             
-            update_errors = list()
-            updated_fields = list()
+            if user_data["email"] != new_email:
+                if "@" not in new_email:
+                    errors.append("Valid email required")
+                user_data["email"] = new_email
+                updates.append("Email")
 
-            if strong_password:
-                if new_password == new_password_verify:
-                    user_data["password"] = new_password
-                    updated_fields.append("Password")
-                else:
-                    update_errors.append("Matching verify password required")
-            else:
-                update_errors.append("Weak password: " + weak_error)
-
-            if (len(new_email) > 0) and ("@" in new_email) :
-                if (user_data["email"] != new_email):
-                    user_data["email"] = new_email
-                    updated_fields.append("Email")
-                else:
-                    update_errors.append("Email is unchanged")                
-            else:
-                update_errors.append("Email is required")
-
-            if len(update_errors) > 0:
-                request.session.flash("Update failed with following errors: " + err, "error") for err in update_errors
-            if len(update_status) > 0:
-                request.session.flash(field + "updated") for field in updated_fields
-
+            if updates:
+                for update in updates:
+                    request.session.flash(update + " updated")
+                return {}
+            if errors:
+                for error in errors:
+                    request.session.flash(error, "error")
+                return {"user": user_data, "profile": profile}
 
         else:
             user_data["blocked"] = "blocked" in request.POST
@@ -397,7 +394,7 @@ def user(request):
             )
         request.userdb.save_user(user_data)
         return {"user": user_data, "profile": profile}
-        # return HTTPFound(location=request.route_url("tests"))
+        return HTTPFound(location=request.route_url("tests"))
     userc = request.userdb.user_cache.find_one({"username": user_name})
     hours = int(userc["cpu_hours"]) if userc is not None else 0
     return {
