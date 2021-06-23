@@ -355,23 +355,24 @@ def user(request):
             new_email = request.params.get("email")    
 
             if len(new_password) > 0:
-                if new_password != new_password_verify:
-                    request.session.flash("Matching verify password required", "error")
-                    return {"user": user_data, "profile": profile}                
-                else:
+                if new_password == new_password_verify:
                     strong_password, password_err = password_strength(
                         new_password, user_name, user_data["email"],
                         (new_email if len(new_email) > 0 else None))
-                    if not strong_password:
+                    if strong_password:
+                        user_data["password"] = new_password
+                        request.session.flash("Password updated")
+                    else:
                         request.session.flash("Weak password: " + password_err, "error")
-                        return {"user": user_data, "profile": profile}
-                user_data["password"] = new_password
-                request.session.flash("Password updated")
+                        return HTTPFound(location=request.route_url("tests"))
+                else:
+                    request.session.flash("Matching verify password required", "error")
+                    return HTTPFound(location=request.route_url("user"))
 
             if len(new_email) > 0 and user_data["email"] != new_email:
                 if "@" not in new_email:
                     request.session.flash("Valid email required", "error")
-                    return {"user": user_data, "profile": profile}
+                    return HTTPFound(location=request.route_url("user"))
                 else:
                     user_data["email"] = new_email
                     request.session.flash("Email updated")
@@ -389,7 +390,7 @@ def user(request):
                 + user_name
             )
         request.userdb.save_user(user_data)
-        return HTTPFound(location=request.route_url("tests"))
+        return HTTPFound(location=request.route_url("user"))
     userc = request.userdb.user_cache.find_one({"username": user_name})
     hours = int(userc["cpu_hours"]) if userc is not None else 0
     return {
