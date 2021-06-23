@@ -165,10 +165,10 @@ def signup(request):
     signup_password_verify = request.POST.get("password2", "")
     signup_email = request.POST.get("email", "")
     
-    strong_password, err = password_strength(
+    strong_password, password_err = password_strength(
         signup_password, signup_username, signup_email)
     if not strong_password:
-        errors.append("Weak password: "+err)
+        errors.append("Weak password: " + password_err)
     if signup_password != signup_password_verify:
         errors.append("Matching verify password required")
     if "@" not in signup_email:
@@ -356,10 +356,10 @@ def user(request):
 
             if len(new_password) > 0:
                 errors = []
-                strong_password, weak_error = password_strength(
+                strong_password, password_err = password_strength(
                     new_password, user_name, new_email)
                 if not strong_password:
-                    errors.append("Weak password: " + weak_password_errors)
+                    errors.append("Weak password: " + password_err)
                 if new_password != new_password_verify:
                     errors.append("Matching verify password required")
                 
