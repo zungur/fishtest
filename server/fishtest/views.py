@@ -355,21 +355,17 @@ def user(request):
             new_email = request.params.get("email")    
 
             if len(new_password) > 0:
-                errors = []
-                strong_password, password_err = password_strength(
-                    new_password, user_name, new_email)
-                if not strong_password:
-                    errors.append("Weak password: " + password_err)
                 if new_password != new_password_verify:
-                    errors.append("Matching verify password required")
-                
-                if errors:
-                    for error in errors:
-                        request.session.flash(error, "error")
-                    return {"user": user_data, "profile": profile}
-                else:
-                    user_data["password"] = new_password
-                    request.session.flash("Password updated")
+                    request.session.flash("Matching verify password required", "error")
+                    return {"user": user_data, "profile": profile}                
+                # # email can be old if not updated?
+                # strong_password, password_err = password_strength(
+                #     new_password, user_name, new_email)
+                # if not strong_password:
+                #     request.session.flash("Weak password: " + password_err, "error")
+                #     return {"user": user_data, "profile": profile}
+                user_data["password"] = new_password
+                request.session.flash("Password updated")
 
             if len(new_email) > 0 and user_data["email"] != new_email:
                 if "@" not in new_email:
