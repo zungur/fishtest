@@ -9,7 +9,6 @@ import math
 import threading
 from datetime import datetime, timezone
 
-import fishtest.stats.stat_util
 from bson.binary import Binary
 from bson.objectid import ObjectId
 from vtjson import (
@@ -40,6 +39,8 @@ from vtjson import (
     union,
     url,
 )
+
+import fishtest.stats.stat_util
 
 run_id = intersect(str, set_name(ObjectId.is_valid, "valid_object_id"))
 run_id_pgns = regex(r"[a-f0-9]{24}-(0|[1-9]\d*)", name="run_id_pgns")
