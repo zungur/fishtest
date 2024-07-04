@@ -43,7 +43,7 @@ class Create50LoginTest(unittest.TestCase):
         self.rundb.userdb.create_user(
             "JoeUser",
             b"O\xc5\xdf\x0cy\x99F\xe5\xf6\xf7\xb7R\x91'*\xa5\xeeRg\x89p\x88\xa2\xb2>;u\xae\x8b\xe6H\x0br\x96.,\xaf\xf4\xc0\x16\x8c\xf7\xa5X\xb4U\x12P\xd2\xc4!\x97\xbc\x89\xee2\xd0\x18\xb3FM\xd5A\x97",
-            b'\x138\xe0\xa5\xec2\xc9\xeb\x1a\x02\xe6\xf1t\x1a\x8dv',
+            b"\x138\xe0\xa5\xec2\xc9\xeb\x1a\x02\xe6\xf1t\x1a\x8dv",
             "email@email.email",
             "https://github.com/official-stockfish/Stockfish",
         )
@@ -112,6 +112,7 @@ class Create50LoginTest(unittest.TestCase):
         self.assertTrue(
             "Invalid username: UserJoe" in request.session.pop_flash("error")[0]
         )
+
 
 class Create90APITest(unittest.TestCase):
     def setUp(self):

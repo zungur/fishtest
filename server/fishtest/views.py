@@ -624,7 +624,9 @@ def user(request):
             new_email = request.params.get("email").strip()
             tests_repo = request.params.get("tests_repo").strip()
 
-            if not request.userdb.check_password(old_password, user["hashed_password"], user["salt"]):
+            if not request.userdb.check_password(
+                old_password, user["hashed_password"], user["salt"]
+            ):
                 request.session.flash("Invalid password!", "error")
                 return home(request)
 
