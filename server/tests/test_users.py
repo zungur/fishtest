@@ -60,6 +60,7 @@ class Create50LoginTest(unittest.TestCase):
         self.rundb.userdb.create_user(
             "JoeUser",
             "secret",
+            "",
             "email@email.email",
             "https://github.com/official-stockfish/Stockfish",
         )
