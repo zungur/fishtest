@@ -55,7 +55,7 @@ class UserDb:
     def hash_password(
         self,
         plaintext_pwd: str,
-        salt: bytes = None,
+        input_salt: bytes = None,
         n: int = 2 ** 14,
         r: int = 8,
         p: int = 5,
@@ -68,44 +68,37 @@ class UserDb:
         dklen (int): Length of the derived key. Defaults to 64.
         """
         # Generate a new 16-byte salt if none is provided
-        if salt is None:
-            salt = os.urandom(16)
+        if input_salt is None:
+            input_salt = os.urandom(16)
 
         hashed_pwd = hashlib.scrypt(
-            plaintext_pwd.encode(), salt=salt, n=n, r=r, p=p, dklen=dklen
+            plaintext_pwd.encode(), salt=input_salt, n=n, r=r, p=p, dklen=dklen
         )
-        return {"hashed_pwd": hashed_pwd.hex(), "salt": salt.hex()}
+        return {"hashed_pwd": hashed_pwd, "salt": input_salt}
 
     def check_password(
         self,
         plaintext_pwd: str,
-        stored_hash: str,
-        salt: str,
+        stored_hash: bytes,
+        stored_salt: bytes,
         n: int = 2 ** 14,
         r: int = 8,
         p: int = 5,
         dklen: int = 64,
     ) -> bool:
-
-        # backwards compatibility for existing plaintexts without a salt
-        if salt == "":
-            salt = "NULL"
-
         tmp_hash = hashlib.scrypt(
-            plaintext_pwd.encode(), salt=bytes.fromhex(salt), n=n, r=r, p=p, dklen=dklen
+            plaintext_pwd.encode(), salt=stored_salt, n=n, r=r, p=p, dklen=dklen
         )
-        return tmp_hash == bytes.fromhex(stored_hash)
+        return tmp_hash == stored_hash
 
     def authenticate(self, username, password):
         user = self.get_user(username)
         if not user:
             sys.stderr.write("Invalid username: '{}'\n".format(username))
             return {"error": "Invalid username: {}".format(username)}
-        if user["password"] != password:
-            sys.stderr.write("Invalid login (plaintext): '{}'\n".format(username))
-            if not self.check_password(password, user["password"], user["salt"]):
-                sys.stderr.write("Invalid login (hashed): '{}'\n".format(username))
-                return {"error": "Invalid password for user: {}".format(username)}
+        if not self.check_password(password, user["hashed_password"], user["salt"]):
+            sys.stderr.write("Invalid login: '{}'\n".format(username))
+            return {"error": "Invalid password for user: {}".format(username)}
         if "blocked" in user and user["blocked"]:
             sys.stderr.write("Blocked account: '{}'\n".format(username))
             return {"error": "Account blocked for user: {}".format(username)}
@@ -113,12 +106,6 @@ class UserDb:
             sys.stderr.write("Pending account: '{}'\n".format(username))
             return {"error": "Account pending for user: {}".format(username)}
 
-        # temp: remove after all the passwords in userdb are hashed
-        if user["password"] == password:
-            hash_result = self.hash_password(user["password"])
-            user["password"] = hash_result["hashed_pwd"]
-            user["salt"] = hash_result["salt"]
-            self.save_user(user)
         return {"username": username, "authenticated": True}
 
     def get_users(self):
@@ -172,7 +159,7 @@ class UserDb:
             # insert the new user in the db
             user = {
                 "username": username,
-                "password": password,
+                "hashed_password": password,
                 "salt": salt,
                 "registration_time": datetime.now(timezone.utc),
                 "pending": True,

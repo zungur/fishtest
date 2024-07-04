@@ -429,7 +429,7 @@ def signup(request):
     hash_result = request.userdb.hash_password(signup_password)
     result = request.userdb.create_user(
         username=signup_username,
-        password=hash_result["hashed_pwd"],
+        hashed_password=hash_result["hashed_pwd"],
         salt=hash_result["salt"],
         email=validated_email,
         tests_repo=tests_repo,

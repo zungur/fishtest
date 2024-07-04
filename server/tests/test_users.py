@@ -16,9 +16,7 @@ class Create10UsersTest(unittest.TestCase):
 
     def tearDown(self):
         self.rundb.userdb.users.delete_many({"username": "JoeUser"})
-        self.rundb.userdb.users.delete_many({"username": "JoeUser2"})
         self.rundb.userdb.user_cache.delete_many({"username": "JoeUser"})
-        self.rundb.userdb.user_cache.delete_many({"username": "JoeUser2"})
         self.rundb.stop()
         testing.tearDown()
 
@@ -38,47 +36,23 @@ class Create10UsersTest(unittest.TestCase):
         response = signup(request)
         self.assertTrue("The resource was found at", response)
 
-        request2 = testing.DummyRequest(
-            userdb=self.rundb.userdb,
-            method="POST",
-            remote_addr="127.0.0.1",
-            params={
-                "username": "JoeUser2",
-                "password": "secret2",
-                "password2": "secret2",
-                "email": "joe2@user.net",
-                "tests_repo": "https://github.com/official-stockfish/Stockfish2",
-            },
-        )
-        response2 = signup(request2)
-        self.assertTrue("The resource was found at", response2)
-
 
 class Create50LoginTest(unittest.TestCase):
     def setUp(self):
         self.rundb = util.get_rundb()
         self.rundb.userdb.create_user(
             "JoeUser",
-            "secret",
-            "",
+            b"O\xc5\xdf\x0cy\x99F\xe5\xf6\xf7\xb7R\x91'*\xa5\xeeRg\x89p\x88\xa2\xb2>;u\xae\x8b\xe6H\x0br\x96.,\xaf\xf4\xc0\x16\x8c\xf7\xa5X\xb4U\x12P\xd2\xc4!\x97\xbc\x89\xee2\xd0\x18\xb3FM\xd5A\x97",
+            b'\x138\xe0\xa5\xec2\xc9\xeb\x1a\x02\xe6\xf1t\x1a\x8dv',
             "email@email.email",
             "https://github.com/official-stockfish/Stockfish",
-        )
-        self.rundb.userdb.create_user(
-            "JoeUser2",
-            b"=\xdd\xe3EQx\xc7\x11\xa09Zy\xc1\x0e\xf7\x07#>t\xf3\xcf\n\xfc_I3#\xecs\xeb\xf1\xb8\x0b\x8e\xeaf\xed\x83\x03<\x16\xd1EP< j\x81\nI\xeem'/(8\xd8\x01)>\x9dMA\x8e".hex(),
-            b"\xab\xa4\xcb\xe3\xde\xcbh\x96S\xfb\x04\xdc\xcb\x811".hex(),
-            "email2@email.email",
-            "https://github.com/official-stockfish/Stockfish2",
         )
         self.config = testing.setUp()
         self.config.add_route("login", "/login")
 
     def tearDown(self):
         self.rundb.userdb.users.delete_many({"username": "JoeUser"})
-        self.rundb.userdb.users.delete_many({"username": "JoeUser2"})
         self.rundb.userdb.user_cache.delete_many({"username": "JoeUser"})
-        self.rundb.userdb.user_cache.delete_many({"username": "JoeUser2"})
         self.rundb.stop()
         testing.tearDown()
 
@@ -138,65 +112,6 @@ class Create50LoginTest(unittest.TestCase):
         self.assertTrue(
             "Invalid username: UserJoe" in request.session.pop_flash("error")[0]
         )
-
-        # Pending user2, wrong password
-        request2 = testing.DummyRequest(
-            userdb=self.rundb.userdb,
-            method="POST",
-            params={"username": "JoeUser2", "password": "badsecret2"},
-        )
-        response2 = login(request2)
-        self.assertTrue(
-            "Invalid password for user: JoeUser2" in request2.session.pop_flash("error")
-        )
-
-        # Pending user2, correct password
-        request2.params["password"] = "secret2"
-        login(request2)
-        self.assertTrue(
-            "Account pending for user: JoeUser2"
-            in request2.session.pop_flash("error")[0]
-        )
-
-        # Approved user2, wrong password
-        user2 = self.rundb.userdb.get_user("JoeUser2")
-        user2["pending"] = False
-        self.rundb.userdb.save_user(user2)
-        request2.params["password"] = "badsecret2"
-        response2 = login(request2)
-        self.assertTrue(
-            "Invalid password for user: JoeUser2" in request2.session.pop_flash("error")
-        )
-
-        # Approved user2, correct password
-        request2.params["password"] = "secret2"
-        response2 = login(request2)
-        self.assertEqual(response2.code, 302)
-        self.assertTrue("The resource was found at" in str(response2))
-
-        # User2 is blocked, correct password
-        user2["blocked"] = True
-        self.rundb.userdb.save_user(user2)
-        response2 = login(request2)
-        self.assertTrue(
-            "Account blocked for user: JoeUser2"
-            in request2.session.pop_flash("error")[0]
-        )
-
-        # User2 is unblocked, correct password
-        user2["blocked"] = False
-        self.rundb.userdb.save_user(user2)
-        response2 = login(request2)
-        self.assertEqual(response2.code, 302)
-        self.assertTrue("The resource was found at" in str(response2))
-
-        # Invalid username, correct password
-        request2.params["username"] = "UserJoe2"
-        response2 = login(request2)
-        self.assertTrue(
-            "Invalid username: UserJoe2" in request2.session.pop_flash("error")[0]
-        )
-
 
 class Create90APITest(unittest.TestCase):
     def setUp(self):

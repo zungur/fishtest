@@ -90,8 +90,8 @@ pgns_schema = intersect(
 user_schema = {
     "_id?": ObjectId,
     "username": username,
-    "password": str,
-    "salt": str,
+    "hashed_password": bytes,
+    "salt": bytes,
     "registration_time": datetime_utc,
     "pending": bool,
     "blocked": bool,
