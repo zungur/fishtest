@@ -62,9 +62,9 @@ class UserDb:
         dklen: int = 64,
     ) -> dict:
         """
-        n (int): CPU/memory cost factor. Defaults to 2**17.
+        n (int): CPU/memory cost factor. Defaults to 2**14.
         r (int): Block size factor. Defaults to 8 (1024 bytes).
-        p (int): Parallelization factor. Defaults to 1.
+        p (int): Parallelization factor. Defaults to 5.
         dklen (int): Length of the derived key. Defaults to 64.
         """
         # Generate a new 16-byte salt if none is provided
@@ -86,6 +86,10 @@ class UserDb:
         p: int = 5,
         dklen: int = 64,
     ) -> bool:
+
+        # backwards compatibility for existing plaintexts without a salt
+        if salt == "":
+            salt = "NULL"
 
         tmp_hash = hashlib.scrypt(
             plaintext_pwd.encode(), salt=bytes.fromhex(salt), n=n, r=r, p=p, dklen=dklen
