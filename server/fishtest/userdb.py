@@ -56,15 +56,15 @@ class UserDb:
         self,
         plaintext_pwd: str,
         salt: bytes = None,
-        n: int = 2 ** 17,
+        n: int = 2 ** 14,
         r: int = 8,
-        p: int = 1,
+        p: int = 5,
         dklen: int = 64,
     ) -> dict:
         """
-        n (int): CPU/memory cost factor. Defaults to 2**17.
+        n (int): CPU/memory cost factor. Defaults to 2**14.
         r (int): Block size factor. Defaults to 8 (1024 bytes).
-        p (int): Parallelization factor. Defaults to 1.
+        p (int): Parallelization factor. Defaults to 5.
         dklen (int): Length of the derived key. Defaults to 64.
         """
         # Generate a new 16-byte salt if none is provided
