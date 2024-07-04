@@ -62,9 +62,9 @@ class UserDb:
         dklen: int = 64,
     ) -> dict:
         """
-        n (int): CPU/memory cost factor. Defaults to 2**14.
+        n (int): CPU/memory cost factor. Defaults to 2**17.
         r (int): Block size factor. Defaults to 8 (1024 bytes).
-        p (int): Parallelization factor. Defaults to 5.
+        p (int): Parallelization factor. Defaults to 1.
         dklen (int): Length of the derived key. Defaults to 64.
         """
         # Generate a new 16-byte salt if none is provided
@@ -74,26 +74,23 @@ class UserDb:
         hashed_pwd = hashlib.scrypt(
             plaintext_pwd.encode(), salt=salt, n=n, r=r, p=p, dklen=dklen
         )
-
-        return {"salt": salt, "hashed_pwd": hashed_pwd}
-
-    # stored_result = hash_with_scrypt(plaintext_pwd)
+        return {"hashed_pwd": hashed_pwd.hex(), "salt": salt.hex()}
 
     def check_password(
         self,
         plaintext_pwd: str,
-        stored_hash: bytes,
-        salt: bytes,
+        stored_hash: str,
+        salt: str,
         n: int = 2 ** 14,
         r: int = 8,
-        p: int = 1,
+        p: int = 5,
         dklen: int = 64,
     ) -> bool:
 
         tmp_hash = hashlib.scrypt(
-            plaintext_pwd.encode(), salt=salt, n=n, r=r, p=p, dklen=dklen
+            plaintext_pwd.encode(), salt=bytes.fromhex(salt), n=n, r=r, p=p, dklen=dklen
         )
-        return tmp_hash == stored_hash
+        return tmp_hash == bytes.fromhex(stored_hash)
 
     def authenticate(self, username, password):
         user = self.get_user(username)
