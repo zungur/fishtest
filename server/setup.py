@@ -15,7 +15,6 @@ requires = [
     "awscli",
     "zxcvbn",
     "email_validator",
-    "argon2-cffi",
     "vtjson",
 ]
 

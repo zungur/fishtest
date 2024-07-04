@@ -2,8 +2,9 @@ import unittest
 from datetime import datetime, timezone
 
 import util
-from fishtest.views import login, signup
 from pyramid import testing
+
+from fishtest.views import login, signup
 
 
 class Create10UsersTest(unittest.TestCase):
@@ -64,7 +65,8 @@ class Create50LoginTest(unittest.TestCase):
         )
         self.rundb.userdb.create_user(
             "JoeUser2",
-            "$argon2id$v=19$m=12288,t=3,p=1$9tW9uRY6ijZ0PEiOcldWoQ$f5YCuVMP77x8Wlrcue0Jn7JGjCmgKy76WQynuIfitdA",
+            b"=\xdd\xe3EQx\xc7\x11\xa09Zy\xc1\x0e\xf7\x07#>t\xf3\xcf\n\xfc_I3#\xecs\xeb\xf1\xb8\x0b\x8e\xeaf\xed\x83\x03<\x16\xd1EP< j\x81\nI\xeem'/(8\xd8\x01)>\x9dMA\x8e"
+            b'"\xab\xa4\xcb\xe3\xde\xcbh\x96S\xfb\x04\xdc\xcb\x811'
             "email2@email.email",
             "https://github.com/official-stockfish/Stockfish2",
         )

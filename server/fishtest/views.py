@@ -9,8 +9,14 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import fishtest.stats.stat_util
 import requests
+from pyramid.httpexceptions import HTTPFound, HTTPNotFound
+from pyramid.security import forget, remember
+from pyramid.view import forbidden_view_config, notfound_view_config, view_config
+from requests.exceptions import ConnectionError, HTTPError
+from vtjson import ValidationError, union, validate
+
+import fishtest.stats.stat_util
 from fishtest.schemas import RUN_VERSION, runs_schema, short_worker_name
 from fishtest.util import (
     email_valid,
@@ -25,11 +31,6 @@ from fishtest.util import (
     password_strength,
     update_residuals,
 )
-from pyramid.httpexceptions import HTTPFound, HTTPNotFound
-from pyramid.security import forget, remember
-from pyramid.view import forbidden_view_config, notfound_view_config, view_config
-from requests.exceptions import ConnectionError, HTTPError
-from vtjson import ValidationError, union, validate
 
 HTTP_TIMEOUT = 15.0
 
@@ -425,9 +426,11 @@ def signup(request):
                 request.session.flash("Captcha failed", "error")
                 return {}
 
+    hash_result = request.userdb.hash_password(signup_password)
     result = request.userdb.create_user(
         username=signup_username,
-        password=request.userdb.hash_password(signup_password),
+        password=hash_result["hashed_pwd"],
+        salt=hash_result["salt"],
         email=validated_email,
         tests_repo=tests_repo,
     )
@@ -635,9 +638,9 @@ def user(request):
                         (new_email if len(new_email) > 0 else None),
                     )
                     if strong_password:
-                        user_data["password"] = request.userdb.hash_password(
-                            new_password
-                        )
+                        hash_result = request.userdb.hash_password(new_password)
+                        user_data["password"] = hash_result["hashed_pwd"]
+                        user_data["salt"] = hash_result["salt"]
                         request.session.flash("Success! Password updated")
                     else:
                         request.session.flash(
@@ -1564,8 +1567,8 @@ def tests_view(request):
             params = value["params"]
             value = [summary]
             for p in params:
-                c_iter = p["c"] / (iter_local**gamma)
-                r_iter = p["a"] / (A + iter_local) ** alpha / c_iter**2
+                c_iter = p["c"] / (iter_local ** gamma)
+                r_iter = p["a"] / (A + iter_local) ** alpha / c_iter ** 2
                 value.append(
                     [
                         p["name"],

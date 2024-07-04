@@ -1,19 +1,15 @@
+import hashlib
+import os
 import sys
 import threading
 import time
 from datetime import datetime, timezone
 from functools import lru_cache
 
-from argon2 import PasswordHasher
-from argon2.exceptions import (
-    HashingError,
-    InvalidHash,
-    VerificationError,
-    VerifyMismatchError,
-)
-from fishtest.schemas import user_schema
 from pymongo import ASCENDING
 from vtjson import ValidationError, validate
+
+from fishtest.schemas import user_schema
 
 DEFAULT_MACHINE_LIMIT = 16
 
@@ -55,30 +51,49 @@ class UserDb:
         with self.user_lock:
             self.cache.clear()
 
+    @lru_cache(maxsize=128)
     def hash_password(
         self,
-        password,
-        time_cost: int = 3,
-        memory_cost: int = 12288,
-        parallelism: int = 1,
-    ):
-        return PasswordHasher(time_cost, memory_cost, parallelism).hash(password)
+        plaintext_pwd: str,
+        salt: bytes = None,
+        n: int = 2 ** 17,
+        r: int = 8,
+        p: int = 1,
+        dklen: int = 64,
+    ) -> dict:
+        """
+        n (int): CPU/memory cost factor. Defaults to 2**17.
+        r (int): Block size factor. Defaults to 8 (1024 bytes).
+        p (int): Parallelization factor. Defaults to 1.
+        dklen (int): Length of the derived key. Defaults to 64.
+        """
+        # Generate a new 16-byte salt if none is provided
+        if salt is None:
+            salt = os.urandom(16)
 
-    @lru_cache(maxsize=128)
-    def check_password(self, hashed_password, password):
-        try:
-            return PasswordHasher().verify(hashed_password, password)
-        except InvalidHash as e:
-            print("InvalidHash:", e, sep="\n")
-        except VerifyMismatchError as e:
-            print("VerifyMismatchError:", e, sep="\n")
-        except HashingError as e:
-            print("HashingError:", e, sep="\n")
-        except VerificationError as e:
-            print("VerificationError:", e, sep="\n")
-        except Exception as e:
-            print("Exception:", e, sep="\n")
-        return False
+        hashed_pwd = hashlib.scrypt(
+            plaintext_pwd.encode(), salt=salt, n=n, r=r, p=p, dklen=dklen
+        )
+
+        return {"salt": salt, "hashed_pwd": hashed_pwd}
+
+    # stored_result = hash_with_scrypt(plaintext_pwd)
+
+    def check_password(
+        self,
+        plaintext_pwd: str,
+        stored_hash: bytes,
+        salt: bytes,
+        n: int = 2 ** 14,
+        r: int = 8,
+        p: int = 1,
+        dklen: int = 64,
+    ) -> bool:
+
+        tmp_hash = hashlib.scrypt(
+            plaintext_pwd.encode(), salt=salt, n=n, r=r, p=p, dklen=dklen
+        )
+        return tmp_hash == stored_hash
 
     def authenticate(self, username, password):
         user = self.get_user(username)
@@ -87,7 +102,7 @@ class UserDb:
             return {"error": "Invalid username: {}".format(username)}
         if user["password"] != password:
             sys.stderr.write("Invalid login (plaintext): '{}'\n".format(username))
-            if not self.check_password(user["password"], password):
+            if not self.check_password(password, user["password"], user["salt"]):
                 sys.stderr.write("Invalid login (hashed): '{}'\n".format(username))
                 return {"error": "Invalid password for user: {}".format(username)}
         if "blocked" in user and user["blocked"]:
@@ -99,7 +114,9 @@ class UserDb:
 
         # temp: remove after all the passwords in userdb are hashed
         if user["password"] == password:
-            user["password"] = self.hash_password(user["password"])
+            hash_result = self.hash_password(user["password"])
+            user["password"] = hash_result["hashed_pwd"]
+            user["salt"] = hash_result["salt"]
             self.save_user(user)
         return {"username": username, "authenticated": True}
 
@@ -147,7 +164,7 @@ class UserDb:
         self.users.replace_one({"_id": user["_id"]}, user)
         self.clear_cache()
 
-    def create_user(self, username, password, email, tests_repo):
+    def create_user(self, username, password, salt, email, tests_repo):
         try:
             if self.find_by_username(username) or self.find_by_email(email):
                 return False
@@ -155,6 +172,7 @@ class UserDb:
             user = {
                 "username": username,
                 "password": password,
+                "salt": salt,
                 "registration_time": datetime.now(timezone.utc),
                 "pending": True,
                 "blocked": False,
