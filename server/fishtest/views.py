@@ -624,8 +624,7 @@ def user(request):
             new_email = request.params.get("email").strip()
             tests_repo = request.params.get("tests_repo").strip()
 
-            # Temporary comparison until passwords are hashed.
-            if old_password != user_data["password"].strip():
+            if not request.userdb.check_password(old_password, user["hashed_password"], user["salt"]):
                 request.session.flash("Invalid password!", "error")
                 return home(request)
 
@@ -639,7 +638,7 @@ def user(request):
                     )
                     if strong_password:
                         hash_result = request.userdb.hash_password(new_password)
-                        user_data["password"] = hash_result["hashed_pwd"]
+                        user_data["hashed_password"] = hash_result["hashed_pwd"]
                         user_data["salt"] = hash_result["salt"]
                         request.session.flash("Success! Password updated")
                     else:
