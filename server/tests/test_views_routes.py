@@ -29,7 +29,9 @@ _GET_ONLY_ROUTES = {
 }
 
 _DUAL_METHOD_ROUTES = {
+    "/forgot_password",
     "/login",
+    "/reset_password/{token}",
     "/signup",
     "/tests/run",
     "/upload",

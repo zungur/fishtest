@@ -47,6 +47,7 @@ from games import (
     FatalException,
     RunException,
     WorkerException,
+    add_auth,
     backup_log,
     cache_read,
     cache_write,
@@ -318,29 +319,58 @@ def verify_remote_sri(install_dir):
     return not tainted
 
 
-def verify_credentials(remote, username, password, cached):
-    # Returns:
-    # True  : username/password are ok
-    # False : username/password are not ok
-    # None  : network error: unable to determine the status of
-    #         username/password
-    req = {}
-    if username != "" and password != "":
-        print(
-            f"Confirming {'cached' if cached else 'supplied'} credentials with {remote}."
+def _verify_single_credential(remote, username, cred, quiet=True):
+    # cred is a dict with "api_key" or "password".
+    # Returns (status, api_key):
+    #   status True  : credential is ok
+    #   status False : credential is not ok
+    #   status None  : network error: unable to determine the status
+    #   api_key      : an API token provisioned by the server (after password
+    #                  auth), or None
+    req = _request_version(remote, username, cred, quiet=quiet)
+    if req is None:
+        return None, None  # network problem (unrecoverable)
+    if "error" in req:
+        return False, None  # invalid credential
+    return True, req.get("api_key")
+
+
+def _request_version(remote, username, cred, quiet=True):
+    payload = {"worker_info": {"username": username}}
+    add_auth(payload, cred)
+    try:
+        return send_api_post_request(
+            remote + "/api/request_version", payload, quiet=quiet
         )
-        payload = {"worker_info": {"username": username}, "password": password}
-        try:
-            req = send_api_post_request(
-                remote + "/api/request_version", payload, quiet=True
-            )
-        except Exception:
-            return None  # network problem (unrecoverable)
-        if "error" in req:
-            return False  # invalid username/password
-        print("Credentials ok!")
-        return True
-    return False  # empty username or password
+    except Exception:
+        return None
+
+
+def verify_credentials(remote, auth, cached):
+    # Tries the API token first, then the password. Returns (status, api_key)
+    # following the conventions of _verify_single_credential.
+    username = auth.get("username", "")
+    if username == "":
+        return False, None
+    print(f"Confirming {'cached' if cached else 'supplied'} credentials with {remote}.")
+    if auth.get("api_key"):
+        status, api_key = _verify_single_credential(
+            remote, username, {"api_key": auth["api_key"]}
+        )
+        if status is True:
+            print("Credentials ok!")
+            return True, api_key
+        if status is None:
+            return None, None
+        # The API token was rejected: fall back to the password if available.
+    if auth.get("password"):
+        status, api_key = _verify_single_credential(
+            remote, username, {"password": auth["password"]}
+        )
+        if status is True:
+            print("Credentials ok!")
+        return status, api_key
+    return False, None
 
 
 def get_credentials(config, options, args):
@@ -349,18 +379,24 @@ def get_credentials(config, options, args):
 
     username = config.get("login", "username")
     password = config.get("login", "password", raw=True)
+    # The API token comes from the --api_key flag (which defaults to the value
+    # stored in the config file). verify_credentials prefers it but falls back
+    # to the password if it has been revoked, so we never need to clear it here.
+    api_key = getattr(options, "api_key", "") or ""
     cached = True
     if len(args) == 2:
         username = args[0]
         password = args[1]
         cached = False
-    if options.no_validation:
-        return username, password
 
-    ret = verify_credentials(remote, username, password, cached)
-    if ret is None:
-        return "", ""
-    elif not ret:
+    auth = {"username": username, "password": password, "api_key": api_key}
+    if options.no_validation:
+        return auth
+
+    status, new_api_key = verify_credentials(remote, auth, cached)
+    if status is None:
+        return {"username": "", "password": "", "api_key": ""}
+    if not status:
         try:
             username = input("\nUsername: ")
             if username != "":
@@ -368,12 +404,16 @@ def get_credentials(config, options, args):
             print("")
         except Exception:
             print("\n")
-            return "", ""
-        else:
-            if not verify_credentials(remote, username, password, False):
-                return "", ""
+            return {"username": "", "password": "", "api_key": ""}
+        auth = {"username": username, "password": password, "api_key": ""}
+        status, new_api_key = verify_credentials(remote, auth, False)
+        if not status:
+            return {"username": "", "password": "", "api_key": ""}
 
-    return username, password
+    if new_api_key:
+        auth["api_key"] = new_api_key
+
+    return auth
 
 
 def verify_fastchess(fastchess_path, fastchess_sha):
@@ -628,6 +668,7 @@ def setup_parameters(worker_dir):
         # (<section>, <option>, <default>, <type>, <preprocessor>),
         ("login", "username", "", str, None),
         ("login", "password", "", str, None),
+        ("login", "api_key", "", str, None),
         ("parameters", "protocol", "https", ["http", "https"], None),
         ("parameters", "host", "tests.stockfishchess.org", str, None),
         ("parameters", "port", "443", int, None),
@@ -768,7 +809,14 @@ def setup_parameters(worker_dir):
         "--no_validation",
         dest="no_validation",
         action="store_true",
-        help="do not validate username/password with server",
+        help="do not validate the credentials with the server",
+    )
+    parser.add_argument(
+        "--api_key",
+        dest="api_key",
+        default=config.get("login", "api_key", raw=True),
+        type=str,
+        help="the worker API token used to authenticate instead of the password",
     )
 
     def my_error(e):
@@ -833,18 +881,21 @@ def setup_parameters(worker_dir):
 
     # Step 6: determine credentials.
 
-    username, password = get_credentials(config, options, args)
+    auth = get_credentials(config, options, args)
 
-    if username == "":
+    if auth["username"] == "":
         print("Invalid or missing credentials.")
         return None
 
-    options.username = username
-    options.password = password
+    options.username = auth["username"]
+    options.password = auth["password"]
+    options.api_key = auth["api_key"]
+    options.auth = auth
 
     # Step 7: write command line parameters to the config file.
     config.set("login", "username", options.username)
     config.set("login", "password", options.password)
+    config.set("login", "api_key", options.api_key)
     config.set("parameters", "protocol", options.protocol)
     config.set("parameters", "host", options.host)
     config.set("parameters", "port", str(options.port))
@@ -1195,12 +1246,12 @@ def get_worker_arch(worker_dir):
     return arch
 
 
-def heartbeat(worker_info, password, remote, current_state):
+def heartbeat(worker_info, auth, remote, current_state):
     print("Start heartbeat.")
     payload = {
-        "password": password,
         "worker_info": worker_info,
     }
+    add_auth(payload, auth)
     while current_state["alive"]:
         time.sleep(1)
         now = datetime.now(timezone.utc)
@@ -1244,7 +1295,7 @@ def utcoffset():
     return f"{'+' if utcoffset >= 0 else '-'}{hh:02d}:{mm:02d}"
 
 
-def verify_worker_version(remote, username, password, worker_lock):
+def verify_worker_version(remote, username, auth, worker_lock):
     # Returns:
     # True: we are the right version and have the correct credentials
     # False: incorrect credentials (the user may have been blocked in the meantime)
@@ -1252,13 +1303,18 @@ def verify_worker_version(remote, username, password, worker_lock):
     # We don't return if the server informs us that a newer version of the worker
     # is available
     print("Verify worker version...")
-    payload = {"worker_info": {"username": username}, "password": password}
-    try:
-        req = send_api_post_request(remote + "/api/request_version", payload)
-    except WorkerException:
+    req = _request_version(remote, username, auth)
+    if req is None:
         return None  # the error message has already been written
+    if "error" in req and auth.get("api_key") and auth.get("password"):
+        # Stale API token: fall back to the password like verify_credentials().
+        req = _request_version(remote, username, {"password": auth["password"]})
+        if req is None:
+            return None
     if "error" in req:
         return False  # likewise
+    if req.get("api_key"):
+        auth["api_key"] = req["api_key"]
     if req["version"] > WORKER_VERSION:
         print(f"Updating worker version to {req['version']}.")
         backup_log()
@@ -1278,7 +1334,7 @@ def verify_worker_version(remote, username, password, worker_lock):
 def fetch_and_handle_task(
     worker_dir,
     worker_info,
-    password,
+    auth,
     remote,
     current_state,
     global_cache,
@@ -1295,7 +1351,7 @@ def fetch_and_handle_task(
     )
 
     # Check the worker version and upgrade if necessary
-    ret = verify_worker_version(remote, worker_info["username"], password, worker_lock)
+    ret = verify_worker_version(remote, worker_info["username"], auth, worker_lock)
     if ret is False:
         current_state["alive"] = False
     if not ret:
@@ -1319,7 +1375,8 @@ def fetch_and_handle_task(
 
     # Let's go!
     print("Fetching task...")
-    payload = {"worker_info": worker_info, "password": password}
+    payload = {"worker_info": worker_info}
+    add_auth(payload, auth)
     try:
         req = send_api_post_request(remote + "/api/request_task", payload)
     except WorkerException:
@@ -1369,7 +1426,7 @@ def fetch_and_handle_task(
             worker_dir,
             worker_info,
             current_state,
-            password,
+            auth,
             remote,
             run,
             task_id,
@@ -1397,12 +1454,12 @@ def fetch_and_handle_task(
     current_state["run"] = None
 
     payload = {
-        "password": password,
         "run_id": str(run["_id"]),
         "task_id": task_id,
         "message": server_message,
         "worker_info": worker_info,
     }
+    add_auth(payload, auth)
 
     if not success:
         print(f"\nException running games:\n{message}", file=sys.stderr)
@@ -1527,9 +1584,7 @@ def worker():
     # Check the worker version and upgrade if necessary
     try:
         if (
-            verify_worker_version(
-                remote, options.username, options.password, worker_lock
-            )
+            verify_worker_version(remote, options.username, options.auth, worker_lock)
             is False
         ):
             return 1
@@ -1592,7 +1647,7 @@ def worker():
     # Start heartbeat thread as a daemon (not strictly necessary, but there might be bugs)
     heartbeat_thread = threading.Thread(
         target=heartbeat,
-        args=(worker_info, options.password, remote, current_state),
+        args=(worker_info, options.auth, remote, current_state),
         daemon=True,
     )
     heartbeat_thread.start()
@@ -1612,7 +1667,7 @@ def worker():
         success = fetch_and_handle_task(
             worker_dir,
             worker_info,
-            options.password,
+            options.auth,
             remote,
             current_state,
             options.global_cache,

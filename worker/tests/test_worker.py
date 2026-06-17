@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from configparser import ConfigParser
 from pathlib import Path
 
@@ -52,9 +53,73 @@ class WorkerTest(unittest.TestCase):
         self.assertTrue(config.has_section("parameters"))
         self.assertTrue(config.has_option("login", "username"))
         self.assertTrue(config.has_option("login", "password"))
+        self.assertTrue(config.has_option("login", "api_key"))
         self.assertTrue(config.has_option("parameters", "host"))
         self.assertTrue(config.has_option("parameters", "port"))
         self.assertTrue(config.has_option("parameters", "concurrency"))
+
+    def test_api_key_flag_is_persisted(self):
+        api_key = "ft_" + "A" * 43
+        sys.argv = [
+            sys.argv[0],
+            "user",
+            "pass",
+            "--api_key",
+            api_key,
+            "--no_validation",
+        ]
+        worker.CONFIGFILE = str(self.tempdir / "foo.txt")
+        worker.setup_parameters(self.tempdir)
+        config = ConfigParser(inline_comment_prefixes=";", interpolation=None)
+        config.read(worker.CONFIGFILE)
+        self.assertEqual(config.get("login", "api_key"), api_key)
+
+    def test_add_auth_prefers_api_key(self):
+        payload = {}
+        games.add_auth(payload, {"api_key": "ft_token", "password": "secret"})
+        self.assertEqual(payload.get("api_key"), "ft_token")
+        self.assertNotIn("password", payload)
+
+    def test_add_auth_falls_back_to_password(self):
+        payload = {}
+        games.add_auth(payload, {"api_key": "", "password": "secret"})
+        self.assertEqual(payload.get("password"), "secret")
+        self.assertNotIn("api_key", payload)
+
+    def test_verify_worker_version_falls_back_to_password(self):
+        auth = {
+            "api_key": "ft_revoked",
+            "password": "secret",
+        }
+        calls = []
+
+        def fake_request(_url, payload, quiet=False):  # noqa: ARG001
+            calls.append(payload)
+            if len(calls) == 1:
+                return {"error": "/api/request_version: Invalid credentials."}
+            return {
+                "version": worker.WORKER_VERSION,
+                "api_key": "ft_new_token",
+            }
+
+        with unittest.mock.patch(
+            "worker.send_api_post_request",
+            side_effect=fake_request,
+        ):
+            self.assertTrue(
+                worker.verify_worker_version(
+                    "https://example.com",
+                    "user",
+                    auth,
+                    worker_lock=None,
+                )
+            )
+        self.assertEqual(len(calls), 2)
+        self.assertIn("api_key", calls[0])
+        self.assertNotIn("password", calls[0])
+        self.assertIn("password", calls[1])
+        self.assertNotIn("api_key", calls[1])
+        self.assertEqual(auth["api_key"], "ft_new_token")
 
     def test_worker_script_with_bad_args(self):
         self.assertFalse((self.worker_dir / "fishtest.cfg").exists())

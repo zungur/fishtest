@@ -14,6 +14,8 @@ import hashlib
 import logging
 import os
 import re
+import secrets
+import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -33,6 +35,10 @@ from vtjson import ValidationError, union, validate
 
 import fishtest.github_api as gh
 import fishtest.stats.stat_util
+from fishtest.constants import (
+    FORGOT_PASSWORD_RATE_LIMIT_SECONDS,
+    PASSWORD_RESET_EXPIRY_HOURS,
+)
 from fishtest.http.boundary import (
     build_template_context,
     commit_session_response,
@@ -41,12 +47,15 @@ from fishtest.http.boundary import (
     remember,
 )
 from fishtest.http.cookie_session import (
+    INSECURE_DEV_ENV,
     CookieSession,
     authenticated_user,
 )
 from fishtest.http.csrf import csrf_token_from_form
 from fishtest.http.dependencies import (
+    DependencyNotInitializedError,
     get_actiondb,
+    get_email_sender,
     get_request_context,
     get_rundb,
     get_userdb,
@@ -107,6 +116,8 @@ from fishtest.http.ui_cookies import (
     read_cookie_toggle_state,
 )
 from fishtest.http.ui_pipeline import apply_http_cache
+from fishtest.lru_cache import LRUCache
+from fishtest.password_hash import hash_password
 from fishtest.run_cache import Prio
 from fishtest.schemas import (
     RUN_VERSION,
@@ -458,9 +469,31 @@ class _ViewContext:
             self.actiondb = context["actiondb"]
             self.workerdb = context["workerdb"]
 
+        # Application-level service (not request-scoped); may be unconfigured.
+        try:
+            self.email_sender = get_email_sender(request)
+        except DependencyNotInitializedError:
+            self.email_sender = None
+
     @property
     def authenticated_userid(self) -> str | None:
-        return authenticated_user(self.session)
+        username = authenticated_user(self.session)
+        if not username:
+            return None
+        user = self.userdb.get_user(username)
+        if user is None:
+            forget(self)
+            self.session.invalidate()
+            return None
+        session_version = self.session.data.get("credentials_version")
+        if session_version is None:
+            session_version = 0
+        user_version = user.get("credentials_version", 0)
+        if session_version != user_version:
+            forget(self)
+            self.session.invalidate()
+            return None
+        return username
 
     def has_permission(self, permission: str) -> bool:
         if permission != "approve_run":
@@ -666,15 +699,21 @@ def login(request: _ViewContext) -> dict[str, Any] | RedirectResponse:
             remember_me_checked=remember_me_checked,
         )
 
-        username = _form_string_value(request.POST, "username")
-        password = _form_string_value(request.POST, "password")
+        username = _form_string_value(request.POST, "username").strip()
+        password = _form_string_value(request.POST, "password").strip()
         token = request.userdb.authenticate(username, password)
         if "error" not in token:
+            user = request.userdb.get_user(username)
             if remember_me_checked:
                 remember(request, username, max_age=SESSION_REMEMBER_ME_MAX_AGE_SECONDS)
             else:
                 # Session ends when the browser is closed
                 remember(request, username)
+            if user is not None:
+                request.session.data["credentials_version"] = user.get(
+                    "credentials_version",
+                    0,
+                )
             next_page = request.params.get("next") or came_from
             return RedirectResponse(url=next_page, status_code=302)
         message = token["error"]
@@ -805,6 +844,268 @@ def signup(request: _ViewContext) -> dict[str, Any] | RedirectResponse:  # noqa:
         )
         return RedirectResponse(url="/login", status_code=302)
     return signup_context
+
+
+# === Password Reset ===
+PASSWORD_RESET_GENERIC_MESSAGE = (
+    "If that email is registered, a password reset link has been sent."
+)
+PASSWORD_RESET_INVALID_MESSAGE = "This password reset link is invalid or has expired."
+PASSWORD_RESET_DEV_DELIVERY_FAILED_MESSAGE = (
+    "Dev notice: password reset email was not sent (configure SMTP or check logs)."
+)
+PASSWORD_RESET_SESSION_USER_ID = "password_reset_user_id"
+PASSWORD_RESET_SESSION_TOKEN_HASH = "password_reset_token_hash"
+PASSWORD_RESET_SESSION_EXPIRES_AT = "password_reset_expires_at"
+FORGOT_PASSWORD_RESPONSE_DELAY_SECONDS = 0.3
+_forgot_password_throttle = LRUCache(
+    maxsize=10_000,
+    expiration=FORGOT_PASSWORD_RATE_LIMIT_SECONDS,
+)
+
+
+def _insecure_dev_enabled() -> bool:
+    return os.environ.get(INSECURE_DEV_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _forgot_password_is_rate_limited(remote_addr: str | None, email: str) -> bool:
+    keys: list[str] = []
+    if remote_addr:
+        keys.append(f"ip:{remote_addr}")
+    normalized_email = email.strip().lower()
+    if normalized_email:
+        keys.append(f"email:{normalized_email}")
+    for key in keys:
+        try:
+            _forgot_password_throttle[key]
+            return True
+        except KeyError:
+            continue
+    for key in keys:
+        _forgot_password_throttle[key] = True
+    return False
+
+
+def _hash_reset_token(token: str) -> str:
+    """Return the sha256 digest stored in the db for a raw reset token."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _clear_password_reset_session(session: CookieSession) -> None:
+    session.data.pop(PASSWORD_RESET_SESSION_USER_ID, None)
+    session.data.pop(PASSWORD_RESET_SESSION_TOKEN_HASH, None)
+    session.data.pop(PASSWORD_RESET_SESSION_EXPIRES_AT, None)
+
+
+def _password_reset_session_matches(
+    session: CookieSession, *, token_hash: str
+) -> bson.ObjectId | None:
+    """Return the user id when the session authorizes this reset token."""
+    session_user_id = session.data.get(PASSWORD_RESET_SESSION_USER_ID)
+    session_token_hash = session.data.get(PASSWORD_RESET_SESSION_TOKEN_HASH)
+    expires_at = session.data.get(PASSWORD_RESET_SESSION_EXPIRES_AT)
+    if session_token_hash != token_hash or not isinstance(session_user_id, str):
+        return None
+    if not isinstance(expires_at, str):
+        return None
+    try:
+        expires = datetime.fromisoformat(expires_at)
+    except ValueError:
+        return None
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=UTC)
+    if expires < datetime.now(UTC):
+        return None
+    try:
+        return bson.ObjectId(session_user_id)
+    except Exception:
+        return None
+
+
+def _begin_password_reset_session(
+    session: CookieSession,
+    *,
+    user_id: bson.ObjectId,
+    token_hash: str,
+    expires_at: datetime,
+) -> None:
+    session.data[PASSWORD_RESET_SESSION_USER_ID] = str(user_id)
+    session.data[PASSWORD_RESET_SESSION_TOKEN_HASH] = token_hash
+    session.data[PASSWORD_RESET_SESSION_EXPIRES_AT] = expires_at.isoformat()
+
+
+def _verify_recaptcha(request: _ViewContext) -> str | None:
+    """Return an error message if the captcha is missing/invalid, else None."""
+    secret = os.environ.get("FISHTEST_CAPTCHA_SECRET", "").strip()
+    captcha_response = _form_string_value(
+        request.POST,
+        "g-recaptcha-response",
+    ).strip()
+    if not secret:
+        return "Captcha configuration is missing"
+    if not captcha_response:
+        return "Captcha required"
+    payload = {
+        "secret": secret,
+        "response": captcha_response,
+        "remoteip": request.remote_addr,
+    }
+    try:
+        response = requests.post(
+            "https://www.google.com/recaptcha/api/siteverify",
+            data=payload,
+            timeout=HTTP_TIMEOUT,
+        ).json()
+    except requests.RequestException, ValueError:
+        return "Captcha verification failed"
+    if "success" not in response or not response["success"]:
+        if "error-codes" in response:
+            logger.warning(response["error-codes"])
+        return "Captcha failed"
+    return None
+
+
+def forgot_password(request: _ViewContext) -> dict[str, Any] | RedirectResponse:
+    _append_no_store_headers(request)
+    if request.authenticated_userid:
+        return home(request)
+
+    recaptcha_site_key = os.environ.get(
+        "FISHTEST_CAPTCHA_SITE_KEY",
+        DEFAULT_RECAPTCHA_SITE_KEY,
+    ).strip()
+    context = {"recaptcha_site_key": recaptcha_site_key}
+
+    if request.method != "POST":
+        return context
+
+    captcha_error = _verify_recaptcha(request)
+    if captcha_error is not None:
+        request.session.flash(captcha_error, "error")
+        return context
+
+    email = _form_string_value(request.POST, "email").strip()
+    if _forgot_password_is_rate_limited(request.remote_addr, email):
+        request.session.flash(PASSWORD_RESET_GENERIC_MESSAGE)
+        return RedirectResponse(url="/login", status_code=302)
+
+    # Respond identically whether or not the email exists (no enumeration).
+    email_is_valid, validated_email = email_valid(email)
+    delivery_failed = False
+    if email_is_valid:
+        user = request.userdb.find_by_email(validated_email)
+        if user is not None:
+            raw_token = secrets.token_urlsafe(32)
+            expires_at = datetime.now(UTC) + timedelta(
+                hours=PASSWORD_RESET_EXPIRY_HOURS
+            )
+            request.userdb.set_password_reset(
+                user,
+                _hash_reset_token(raw_token),
+                expires_at,
+            )
+            reset_url = f"{_host_url(request)}/reset_password/{raw_token}"
+            body = (
+                "We received a request to reset your Fishtest password.\n\n"
+                f"Reset link: {reset_url}\n\n"
+                f"This link expires in {PASSWORD_RESET_EXPIRY_HOURS} hour(s) "
+                "and can be used only once.\n\n"
+                "If you did not request a password reset you can safely ignore "
+                "this email."
+            )
+            smtp_configured = (
+                request.email_sender is not None and request.email_sender.is_configured
+            )
+            if smtp_configured:
+                try:
+                    request.email_sender.send(
+                        user["email"],
+                        "Fishtest password reset",
+                        body,
+                    )
+                except Exception as e:
+                    delivery_failed = True
+                    logger.error("Failed to send password reset email: %s", e)
+            else:
+                delivery_failed = True
+                logger.error(
+                    "Password reset requested but email sending is not configured"
+                )
+
+    request.session.flash(PASSWORD_RESET_GENERIC_MESSAGE)
+    if delivery_failed and _insecure_dev_enabled():
+        request.session.flash(PASSWORD_RESET_DEV_DELIVERY_FAILED_MESSAGE, "warning")
+    time.sleep(FORGOT_PASSWORD_RESPONSE_DELAY_SECONDS)
+    return RedirectResponse(url="/login", status_code=302)
+
+
+def reset_password(request: _ViewContext) -> dict[str, Any] | RedirectResponse:
+    _append_no_store_headers(request)
+    token = request.matchdict.get("token", "")
+    token_hash = _hash_reset_token(token)
+
+    if request.method != "POST":
+        user = request.userdb.find_by_reset_token(token_hash)
+        if user is not None:
+            expires_at = user["password_reset"]["expires_at"]
+            if request.userdb.consume_reset_token(user["_id"], token_hash):
+                _begin_password_reset_session(
+                    request.session,
+                    user_id=user["_id"],
+                    token_hash=token_hash,
+                    expires_at=expires_at,
+                )
+            else:
+                user = None
+        elif _password_reset_session_matches(request.session, token_hash=token_hash):
+            pass
+        else:
+            request.session.flash(PASSWORD_RESET_INVALID_MESSAGE, "error")
+            return RedirectResponse(url="/login", status_code=302)
+        return {"token": token}
+
+    user_id = _password_reset_session_matches(request.session, token_hash=token_hash)
+    if user_id is None:
+        request.session.flash(PASSWORD_RESET_INVALID_MESSAGE, "error")
+        return RedirectResponse(url="/login", status_code=302)
+
+    user = request.userdb.users.find_one({"_id": user_id})
+    if user is None:
+        _clear_password_reset_session(request.session)
+        request.session.flash(PASSWORD_RESET_INVALID_MESSAGE, "error")
+        return RedirectResponse(url="/login", status_code=302)
+
+    new_password = _form_string_value(request.POST, "password").strip()
+    new_password_verify = _form_string_value(request.POST, "password2").strip()
+    if new_password != new_password_verify:
+        request.session.flash("Error! Matching verify password required", "error")
+        return {"token": token}
+
+    strong_password, password_err = password_strength(
+        new_password,
+        user["username"],
+        user["email"],
+    )
+    if not strong_password:
+        request.session.flash(password_err, "error")
+        return {"token": token}
+
+    result = request.userdb.update_password_after_reset(
+        user_id,
+        hash_password(new_password),
+    )
+    _clear_password_reset_session(request.session)
+    if not result.modified_count:
+        request.session.flash(PASSWORD_RESET_INVALID_MESSAGE, "error")
+        return RedirectResponse(url="/login", status_code=302)
+
+    request.session.flash("Success! Your password has been updated. Please log in.")
+    return RedirectResponse(url="/login", status_code=302)
 
 
 # === Lists ===
@@ -1685,6 +1986,17 @@ def user(request: _ViewContext) -> dict[str, Any] | RedirectResponse:  # noqa: C
     user_data = request.userdb.get_user(user_name)
     if user_data is None:
         raise StarletteHTTPException(status_code=404)
+    if "reset_api_key" in request.POST and profile:
+        api_key_password = _form_string_value(request.POST, "password").strip()
+        if not request.userdb.password_is_correct(user_name, api_key_password):
+            request.session.flash("Invalid password!", "error")
+            return home(request)
+        request.userdb.reset_api_key(user_data)
+        request.session.flash(
+            "Success! A new API token was generated. "
+            "Update your worker configuration to keep contributing.",
+        )
+        return RedirectResponse(url="/user", status_code=302)
     if "user" in request.POST:
         if profile:
             old_password = _form_string_value(request.POST, "old_password").strip()
@@ -1692,9 +2004,9 @@ def user(request: _ViewContext) -> dict[str, Any] | RedirectResponse:  # noqa: C
             new_password_verify = _form_string_value(request.POST, "password2").strip()
             new_email = _form_string_value(request.POST, "email").strip()
             tests_repo = _form_string_value(request.POST, "tests_repo").strip()
+            password_changed = False
 
-            # Temporary comparison until passwords are hashed.
-            if old_password != user_data["password"].strip():
+            if not request.userdb.password_is_correct(user_name, old_password):
                 request.session.flash("Invalid password!", "error")
                 return home(request)
 
@@ -1707,8 +2019,10 @@ def user(request: _ViewContext) -> dict[str, Any] | RedirectResponse:  # noqa: C
                         (new_email if len(new_email) > 0 else None),
                     )
                     if strong_password:
-                        user_data["password"] = new_password
-                        request.session.flash("Success! Password updated")
+                        user_data["password"] = hash_password(new_password)
+                        request.userdb.rotate_api_key(user_data)
+                        request.userdb.bump_credentials_version(user_data)
+                        password_changed = True
                     else:
                         request.session.flash(password_err, "error")
                         return home(request)
@@ -1741,6 +2055,13 @@ def user(request: _ViewContext) -> dict[str, Any] | RedirectResponse:  # noqa: C
                 user_data["email"] = validated_email
                 request.session.flash("Success! Email updated")
             request.userdb.save_user(user_data)
+            if password_changed:
+                forget(request)
+                request.session.invalidate()
+                request.session.flash(
+                    "Success! Your password has been updated. Please log in.",
+                )
+                return RedirectResponse(url="/login", status_code=302)
         elif "blocked" in request.POST and request.POST["blocked"].isdigit():
             user_data["blocked"] = bool(int(request.POST["blocked"]))
             request.session.flash(
@@ -3740,6 +4061,24 @@ _VIEW_ROUTES: list[_ViewRoute] = [
         "/signup",
         {
             "renderer": "signup.html.j2",
+            "require_csrf": True,
+            "request_method": ("GET", "POST"),
+        },
+    ),
+    (
+        forgot_password,
+        "/forgot_password",
+        {
+            "renderer": "forgot_password.html.j2",
+            "require_csrf": True,
+            "request_method": ("GET", "POST"),
+        },
+    ),
+    (
+        reset_password,
+        "/reset_password/{token}",
+        {
+            "renderer": "reset_password.html.j2",
             "require_csrf": True,
             "request_method": ("GET", "POST"),
         },

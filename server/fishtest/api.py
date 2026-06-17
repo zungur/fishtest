@@ -14,11 +14,35 @@ from vtjson import ValidationError, validate
 
 import fishtest.github_api as gh
 from fishtest.http.boundary import ApiRequestShim, get_request_shim
+from fishtest.lru_cache import lru_cache
 from fishtest.schemas import api_access_schema, api_schema, gzip_data
 from fishtest.stats.stat_util import SPRT_elo, get_elo
 from fishtest.util import strip_run, worker_name
 
 WORKER_VERSION = 323
+
+
+# Bounded cache of successful password verifications so the expensive scrypt
+# KDF runs at most once per credential per TTL. Only successes are cached, and
+# account status (blocked/pending) is re-checked on every request by the
+# caller. ``stored_password`` is part of the cache key so a password change
+# invalidates stale entries immediately. Workers that authenticate with an API
+# token never reach this path.
+@lru_cache(
+    maxsize=1024,
+    expiration=60,
+    refresh=False,
+    filter=lambda f, args, kw, val: val is True,
+)
+def _password_ok_cached(userdb, username, password, stored_password):
+    return userdb.password_is_correct(username, password)
+
+
+def _password_ok(userdb, username, password, stored_password):
+    if not stored_password:
+        return False
+    return _password_ok_cached(userdb, username, password, stored_password)
+
 
 WORKER_API_PATHS = {
     "/api/request_version",
@@ -80,26 +104,52 @@ class WorkerApi(GenericApi):
 
     def __init__(self, request):
         super().__init__(request)
+        # When a worker authenticates with a password we hand it a freshly
+        # provisioned API token so it can stop sending the password.
+        self._provisioned_api_key = None
         # is the request valid json?
         try:
             self.request_body = request.json_body
         except Exception:
             self.handle_error("request is not json encoded")
 
-    def validate_username_password(self):
+    def add_time(self, result):
+        result = super().add_time(result)
+        if self._provisioned_api_key is not None:
+            result.setdefault("api_key", self._provisioned_api_key)
+        return result
+
+    def validate_auth(self):
         # Is the request syntactically correct?
         try:
             validate(api_access_schema, self.request_body, "request")
         except ValidationError as e:
             self.handle_error(str(e))
 
-        # is the supplied password correct?
-        token = self.request.userdb.authenticate(
-            self.request_body["worker_info"]["username"],
-            self.request_body["password"],
-        )
-        if "error" in token:
-            self.handle_error(token["error"], status_code=401)
+        username = self.request_body["worker_info"]["username"]
+        userdb = self.request.userdb
+
+        # Prefer the API token: a cheap constant-time compare, no KDF cost.
+        api_key = self.request_body.get("api_key", "")
+        if api_key:
+            token = userdb.authenticate_worker(username, api_key)
+            if "error" in token:
+                self.handle_error(token["error"], status_code=401)
+            return
+
+        # Fallback: password auth (first run / legacy workers). The scrypt cost
+        # is bounded by a verification cache; account status is re-checked here.
+        password = self.request_body.get("password", "")
+        user = userdb.get_user(username)
+        stored_password = user.get("password") if user is not None else ""
+        if not (password and _password_ok(userdb, username, password, stored_password)):
+            self.handle_error("Invalid username or password.", status_code=401)
+        status_error = userdb._account_status_error(user, username)
+        if status_error is not None:
+            self.handle_error(status_error["error"], status_code=401)
+
+        # Provision an API token so the worker can switch off password auth.
+        self._provisioned_api_key = userdb.ensure_api_key(username)
 
     def validate_request(self):
         """This function will load the run from the cache or the db,
@@ -112,7 +162,7 @@ class WorkerApi(GenericApi):
         self.__task = None
 
         # Preliminary validation.
-        self.validate_username_password()
+        self.validate_auth()
 
         # Is the request syntactically correct?
         try:
@@ -315,7 +365,7 @@ class WorkerApi(GenericApi):
     def request_version(self):
         # By being more lax here, we can be more strict
         # elsewhere since the worker will upgrade.
-        self.validate_username_password()
+        self.validate_auth()
         return self.add_time({"version": WORKER_VERSION})
 
     def beat(self):

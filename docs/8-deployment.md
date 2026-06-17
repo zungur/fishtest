@@ -25,9 +25,39 @@
 | `OPENAPI_URL` | No | (empty) | Set to `/openapi.json` to enable `/docs` and `/redoc` (development-only) |
 | `UVICORN_WORKERS` | No | -- | Must be `1` on primary (enforced at startup) |
 | `WEB_CONCURRENCY` | No | -- | Fallback for `UVICORN_WORKERS` (checked if unset) |
+| `FISHTEST_SMTP_HOST` | Password reset: Yes | -- | SMTP relay host |
+| `FISHTEST_SMTP_PORT` | No | `587` | SMTP port (`465` uses implicit TLS) |
+| `FISHTEST_SMTP_USERNAME` | No | -- | SMTP auth username |
+| `FISHTEST_SMTP_PASSWORD` | No | -- | SMTP auth password |
+| `FISHTEST_SMTP_FROM_EMAIL` | Password reset: Yes | -- | From address for transactional email |
+| `FISHTEST_SMTP_FROM_NAME` | No | `Fishtest` | From display name |
+| `FISHTEST_SMTP_USE_TLS` | No | `true` | STARTTLS on non-465 ports |
 
 **Session invalidation**: deploying a new `FISHTEST_AUTHENTICATION_SECRET`
 invalidates all existing sessions. Users must re-authenticate once.
+
+### Credential migration (password hashing and API tokens)
+
+Before deploying a release that introduces scrypt password hashes and worker
+API tokens, run these one-shot scripts from `server/` (safe to repeat):
+
+```bash
+cd server
+.venv/bin/python utils/backfill_api_keys.py
+.venv/bin/python utils/hash_passwords.py
+python3 utils/create_indexes.py users   # adds password_reset.token index
+```
+
+Recommended order:
+
+1. Run `backfill_api_keys.py` and `hash_passwords.py` against the live database.
+2. Deploy the server (worker API v323+ understands `api_key` auth).
+3. Ask contributors to update `fishtest.cfg` after a password change or reset:
+   the server rotates their `api_key` and invalidates old worker sessions.
+
+Workers still using password auth receive an `api_key` on the next successful
+request and should persist it in `fishtest.cfg` so later requests can omit the
+password.
 
 ### Primary instance detection
 

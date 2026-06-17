@@ -311,6 +311,76 @@ class TestHttpApi(unittest.TestCase):
                 path=path,
             )
 
+    def _api_key(self) -> str:
+        return self.rundb.userdb.get_user(self.username)["api_key"]
+
+    def _api_key_payload(self, *, api_key: str) -> dict:
+        return {
+            "api_key": api_key,
+            "worker_info": copy.deepcopy(self.worker_info),
+        }
+
+    def test_request_version_with_api_key(self):
+        response = self.client.post(
+            "/api/request_version",
+            json=self._api_key_payload(api_key=self._api_key()),
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["version"], WORKER_VERSION)
+
+    def test_request_version_wrong_api_key(self):
+        response = self.client.post(
+            "/api/request_version",
+            json=self._api_key_payload(api_key="ft_not_a_real_key"),
+        )
+        self._assert_worker_error_response(
+            response,
+            status_code=401,
+            path="/api/request_version",
+        )
+
+    def test_password_auth_returns_api_key(self):
+        response = self.client.post(
+            "/api/request_version",
+            json=self._payload(password=self.password),
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        # After a password login the server hands the worker its API token so
+        # it can stop sending the password.
+        self.assertEqual(body.get("api_key"), self._api_key())
+
+    def test_password_auth_provisions_missing_api_key(self):
+        user = self.rundb.userdb.get_user(self.username)
+        old_key = user.get("api_key")
+        try:
+            user.pop("api_key", None)
+            self.rundb.userdb.save_user(user)
+            response = self.client.post(
+                "/api/request_version",
+                json=self._payload(password=self.password),
+            )
+            self.assertEqual(response.status_code, 200)
+            body = response.json()
+            new_key = body.get("api_key")
+            self.assertTrue(isinstance(new_key, str) and new_key.startswith("ft_"))
+            self.assertEqual(self.rundb.userdb.get_api_key(self.username), new_key)
+        finally:
+            restored = self.rundb.userdb.get_user(self.username)
+            if old_key is not None:
+                restored["api_key"] = old_key
+            self.rundb.userdb.save_user(restored)
+
+    def test_api_key_auth_does_not_return_api_key(self):
+        response = self.client.post(
+            "/api/request_version",
+            json=self._api_key_payload(api_key=self._api_key()),
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertNotIn("api_key", body)
+
     def test_worker_endpoints_missing_worker_info_is_validation_error(self):
         endpoints = [
             "/api/request_version",

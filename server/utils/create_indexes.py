@@ -98,6 +98,11 @@ def create_nns_indexes():
 
 def create_users_indexes():
     db["users"].create_index("username", unique=True)
+    db["users"].create_index(
+        "password_reset.token",
+        name="password_reset_token",
+        sparse=True,
+    )
 
 
 def create_workers_indexes():

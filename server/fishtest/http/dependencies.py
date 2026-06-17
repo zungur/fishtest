@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from starlette.requests import Request
 
 from fishtest.actiondb import ActionDb
+from fishtest.emailer import EmailSender
 from fishtest.http.cookie_session import CookieSession, authenticated_user, load_session
 from fishtest.rundb import RunDb
 from fishtest.userdb import UserDb
@@ -76,6 +77,11 @@ def get_actiondb(request: Request) -> ActionDb:
 def get_workerdb(request: Request) -> WorkerDb:
     """Return the request-scoped WorkerDb handle."""
     return _require_dependency(request, "workerdb", WorkerDb)
+
+
+def get_email_sender(request: Request) -> EmailSender:
+    """Return the application's EmailSender."""
+    return _require_dependency(request, "email_sender", EmailSender)
 
 
 def get_request_context(request: Request) -> RequestContext:

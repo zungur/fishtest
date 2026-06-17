@@ -56,7 +56,21 @@ class TestHttpBoundary(unittest.TestCase):
         )
         from fishtest.http.session_middleware import _encode_cookie_value
 
-        payload: dict[str, object] = {"user": username}
+        user = self.rundb.userdb.get_user(username)
+        if user is None:
+            self.rundb.userdb.create_user(
+                username,
+                "boundary-test-password",
+                f"{username.lower()}@example.com",
+                "https://github.com/official-stockfish/Stockfish",
+            )
+            user = self.rundb.userdb.get_user(username)
+        credentials_version = user.get("credentials_version", 0) if user else 0
+
+        payload: dict[str, object] = {
+            "user": username,
+            "credentials_version": credentials_version,
+        }
         signer = TimestampSigner(session_secret_key())
         cookie_value = _encode_cookie_value(payload, signer)
         client.cookies.set(SESSION_COOKIE_NAME, cookie_value)

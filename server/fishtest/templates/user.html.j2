@@ -255,6 +255,49 @@
       {% endif %}
     {% endif %}
   </form>
+
+  {% if profile %}
+    <div class="alert alert-secondary mt-4">
+      <h5 class="alert-heading">Worker API token</h5>
+      <p class="mb-2">
+        Workers authenticate with this token instead of your password. Add it to
+        your worker <code>fishtest.cfg</code> under the <code>[login]</code>
+        section as <code>api_key</code>, or pass <code>--api_key</code> on the
+        command line. Keep it secret; generating a new one invalidates the old.
+      </p>
+      <div class="input-group mb-3">
+        <input
+          type="text"
+          class="form-control font-monospace"
+          id="api_key"
+          value="{{ user.get('api_key', '') }}"
+          readonly
+        >
+      </div>
+      <form action="{{ request.url }}" method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <div class="input-group mb-3">
+          <div class="form-floating flex-grow-1">
+            <input
+              type="password"
+              class="form-control"
+              id="api_key_password"
+              name="password"
+              placeholder="Password"
+              required
+            />
+            <label for="api_key_password" class="d-flex align-items-end">Password</label>
+          </div>
+        </div>
+        <button
+          type="submit"
+          name="reset_api_key"
+          value="1"
+          class="btn btn-outline-danger w-100"
+        >Generate new token</button>
+      </form>
+    </div>
+  {% endif %}
 </div>
 
 <script src="{{ static_url('fishtest:static/js/toggle_password.js') }}"></script>

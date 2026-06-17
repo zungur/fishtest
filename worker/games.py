@@ -321,14 +321,27 @@ def send_api_post_request(api_url, payload, quiet=False):
     return response
 
 
-def post_to_worker_log(
-    worker_info, password, remote, message, run_id=None, task_id=None
-):
+def add_auth(payload, auth):
+    """Attach worker credentials to an API payload.
+
+    Prefers the API token (a cheap server-side compare, no password KDF) and
+    falls back to the password. ``auth`` is a dict that may contain "api_key"
+    and/or "password".
+    """
+    api_key = auth.get("api_key")
+    if api_key:
+        payload["api_key"] = api_key
+    else:
+        payload["password"] = auth.get("password", "")
+    return payload
+
+
+def post_to_worker_log(worker_info, auth, remote, message, run_id=None, task_id=None):
     payload = {
-        "password": password,
         "worker_info": worker_info,
         "message": message,
     }
+    add_auth(payload, auth)
     if run_id is not None:
         payload["run_id"] = run_id
     if task_id is not None:
@@ -1036,7 +1049,7 @@ def parse_fastchess_output(
     base_name_long,
     current_state,
     worker_info,
-    password,
+    auth,
     remote,
     result,
     spsa_tuning,
@@ -1199,7 +1212,7 @@ def parse_fastchess_output(
                 )
                 post_to_worker_log(
                     worker_info,
-                    password,
+                    auth,
                     remote,
                     message,
                     run_id=run_id,
@@ -1330,7 +1343,7 @@ def launch_fastchess(
     base_name,
     current_state,
     worker_info,
-    password,
+    auth,
     remote,
     result,
     spsa_tuning,
@@ -1418,7 +1431,7 @@ def launch_fastchess(
                     base_name,
                     current_state,
                     worker_info,
-                    password,
+                    auth,
                     remote,
                     result,
                     spsa_tuning,
@@ -1455,7 +1468,7 @@ def run_games(
     worker_dir,
     worker_info,
     current_state,
-    password,
+    auth,
     remote,
     run,
     task_id,
@@ -1502,12 +1515,12 @@ def run_games(
     input_stats["time_losses"] = input_stats.get("time_losses", 0)
 
     result = {
-        "password": password,
         "run_id": str(run["_id"]),
         "task_id": task_id,
         "stats": input_stats,
         "worker_info": worker_info,
     }
+    add_auth(result, auth)
 
     games_remaining = task["num_games"] - input_total_games
 
@@ -1845,7 +1858,7 @@ def run_games(
             base_name,
             current_state,
             worker_info,
-            password,
+            auth,
             remote,
             result,
             spsa_tuning,

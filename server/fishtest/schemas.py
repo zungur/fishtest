@@ -40,6 +40,7 @@ from vtjson import (
 
 import fishtest.stats.stat_util
 from fishtest.constants import (
+    API_KEY_PATTERN,
     PASSWORD_MAX_LENGTH,
     VALID_USERNAME_PATTERN,
     supported_arches,
@@ -65,6 +66,12 @@ legacy_username = intersect(
 )
 username = union(valid_username, legacy_username)
 action_username = union(username, "fishtest.system")
+api_key = regex(API_KEY_PATTERN, name="api_key")
+# Either a legacy plaintext password or a self-describing scrypt hash.
+scrypt_hash = regex(
+    r"\$scrypt\$n=\d+,r=\d+,p=\d+\$[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+",
+    name="scrypt_hash",
+)
 net_name = regex(r"nn-[a-f0-9]{12}.nnue", name="net_name")
 tc = regex(r"([1-9]\d*/)?\d+(\.\d+)?(\+\d+(\.\d+)?)?", name="tc")
 str_int = regex(r"[1-9]\d*", name="str_int")
@@ -122,7 +129,16 @@ pgns_schema = intersect(
 user_schema = {
     "_id?": ObjectId,
     "username": username,
-    "password": intersect(str, size(0, PASSWORD_MAX_LENGTH)),
+    # Either a legacy plaintext password (upgraded lazily on next login) or a
+    # scrypt hash produced by fishtest.password_hash.
+    "password": union(intersect(str, size(0, PASSWORD_MAX_LENGTH)), scrypt_hash),
+    # Worker API token. Optional during migration; backfilled for existing users.
+    "api_key?": api_key,
+    # Single-use password reset token (sha256 digest) with expiry.
+    "password_reset?": {
+        "token": regex(r"[a-f0-9]{64}", name="reset_token"),
+        "expires_at": datetime_utc,
+    },
     "registration_time": datetime_utc,
     "pending": bool,
     "blocked": bool,
@@ -130,6 +146,8 @@ user_schema = {
     "groups": intersect([str, ...], unique),
     "tests_repo": union(github_repo, ""),
     "machine_limit": uint,
+    # Bumped on password change, reset, or API-token rotation to invalidate web sessions.
+    "credentials_version?": uint,
 }
 
 kvstore_schema = {
@@ -500,11 +518,21 @@ def valid_spsa_results(stats):
     return stats["wins"] + stats["losses"] + stats["draws"] == stats["num_games"]
 
 
-api_access_schema = lax({"password": str, "worker_info": {"username": username}})
+api_access_schema = intersect(
+    lax(
+        {
+            "password?": str,
+            "api_key?": str,
+            "worker_info": {"username": username},
+        }
+    ),
+    at_least_one_of("password", "api_key"),
+)
 
 api_schema = intersect(
     {
-        "password": str,
+        "password?": str,
+        "api_key?": str,
         "run_id?": run_id,
         "task_id?": task_id,
         "pgn?": str,
@@ -522,6 +550,7 @@ api_schema = intersect(
         ),
         "stats?": results_schema,
     },
+    at_least_one_of("password", "api_key"),
     ifthen(keys("task_id"), keys("run_id")),
 )
 
