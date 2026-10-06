@@ -10,7 +10,11 @@ import sys
 
 from pymongo import ASCENDING, DESCENDING, MongoClient
 
-from fishtest.constants import WORKER_SESSION_IDLE_SECONDS
+from fishtest.constants import (
+    KNOWN_LOGIN_IP_DAYS,
+    PASSWORD_DAILY_FAILURE_WINDOW_SECONDS,
+    WORKER_SESSION_IDLE_SECONDS,
+)
 from fishtest.rundb import RunDb
 
 db_name = "fishtest_new"
@@ -124,6 +128,30 @@ def create_worker_sessions_indexes():
     )
 
 
+def create_known_login_ips_indexes():
+    db["known_login_ips"].create_index(
+        [("username", ASCENDING), ("ip", ASCENDING)],
+        name="known_login_ips_user_ip",
+        unique=True,
+    )
+    db["known_login_ips"].create_index(
+        "last_success",
+        name="known_login_ips_ttl",
+        expireAfterSeconds=KNOWN_LOGIN_IP_DAYS * 24 * 3600,
+    )
+
+
+def create_password_failures_indexes():
+    db["password_failures"].create_index(
+        "username", name="password_failures_username", unique=True
+    )
+    db["password_failures"].create_index(
+        "since",
+        name="password_failures_ttl",
+        expireAfterSeconds=PASSWORD_DAILY_FAILURE_WINDOW_SECONDS,
+    )
+
+
 def create_actions_indexes():
     db["actions"].create_index(
         [("time", DESCENDING), ("_id", DESCENDING)],
@@ -202,6 +230,12 @@ if __name__ == "__main__":
             elif collection_name == "worker_sessions":
                 drop_indexes("worker_sessions")
                 create_worker_sessions_indexes()
+            elif collection_name == "known_login_ips":
+                drop_indexes("known_login_ips")
+                create_known_login_ips_indexes()
+            elif collection_name == "password_failures":
+                drop_indexes("password_failures")
+                create_password_failures_indexes()
             elif collection_name == "actions":
                 drop_indexes("actions")
                 create_actions_indexes()

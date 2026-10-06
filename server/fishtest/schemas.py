@@ -152,6 +152,21 @@ worker_session_schema = {
     "last_seen": datetime_utc,
 }
 
+known_login_ip_schema = {
+    "_id?": ObjectId,
+    "username": username,
+    "ip": str,
+    "last_success": datetime_utc,
+}
+
+password_failure_schema = {
+    "_id?": ObjectId,
+    "username": username,
+    "count": uint,
+    # Start of the counting window (the first failure in it).
+    "since": datetime_utc,
+}
+
 kvstore_schema = {
     "_id": str,
     "value": anything,

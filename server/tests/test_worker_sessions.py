@@ -4,6 +4,8 @@ from datetime import UTC, datetime, timedelta
 import test_support
 
 from fishtest.constants import (
+    KNOWN_LOGIN_IP_DAYS,
+    PASSWORD_DAILY_FAILURE_WINDOW_SECONDS,
     WORKER_SESSION_IDLE_SECONDS,
     WORKER_SESSION_MAX_AGE_SECONDS,
     WORKER_SESSION_MIN_CAP,
@@ -173,3 +175,100 @@ class TestWorkerSessions(unittest.TestCase):
         self.sessions.create(self.other_username, 0, 0)
         self.assertEqual(self._count(), WORKER_SESSION_MIN_CAP)
         self.assertEqual(self._count(self.other_username), 1)
+
+
+class TestKnownLoginIps(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.rundb = test_support.get_rundb()
+        cls.known_ips = cls.rundb.known_login_ips
+        cls.username = "TestKnownIpUser"
+
+    def setUp(self):
+        self._clear()
+        self.addCleanup(self._clear)
+
+    def _clear(self):
+        self.known_ips.ips.delete_many({"username": self.username})
+        self.known_ips.failures.delete_many({"username": self.username})
+        self.known_ips._cache.clear()
+
+    def test_failures_are_counted_per_user(self):
+        self.addCleanup(
+            self.known_ips.failures.delete_many, {"username": "SomeoneElse"}
+        )
+        self.assertEqual(self.known_ips.recent_failures(self.username), 0)
+        for _ in range(3):
+            self.known_ips.count_failure(self.username)
+        self.known_ips.count_failure("SomeoneElse")
+        self.assertEqual(self.known_ips.recent_failures(self.username), 3)
+        self.assertEqual(self.known_ips.recent_failures("SomeoneElse"), 1)
+
+    def test_failure_window_starts_again_after_it_ends(self):
+        for _ in range(3):
+            self.known_ips.count_failure(self.username)
+        expired = datetime.now(UTC) - timedelta(
+            seconds=PASSWORD_DAILY_FAILURE_WINDOW_SECONDS + 60
+        )
+        self.known_ips.failures.update_one(
+            {"username": self.username}, {"$set": {"since": expired}}
+        )
+        self.assertEqual(self.known_ips.recent_failures(self.username), 0)
+        self.known_ips.count_failure(self.username)
+        self.assertEqual(self.known_ips.recent_failures(self.username), 1)
+
+    def test_forget_user_clears_failures(self):
+        self.known_ips.count_failure(self.username)
+        self.known_ips.forget_user(self.username)
+        self.assertEqual(self.known_ips.recent_failures(self.username), 0)
+
+    def test_remembered_ip_is_known_for_that_user_only(self):
+        self.assertFalse(self.known_ips.is_known(self.username, "192.0.2.1"))
+        self.known_ips.remember(self.username, "192.0.2.1")
+        self.assertTrue(self.known_ips.is_known(self.username, "192.0.2.1"))
+        self.assertFalse(self.known_ips.is_known(self.username, "192.0.2.2"))
+        self.assertFalse(self.known_ips.is_known("SomeoneElse", "192.0.2.1"))
+        self.known_ips._cache.clear()
+        self.assertTrue(self.known_ips.is_known(self.username, "192.0.2.1"))
+
+    def test_forget_user(self):
+        self.addCleanup(self.known_ips.ips.delete_many, {"username": "SomeoneElse"})
+        self.known_ips.remember(self.username, "192.0.2.1")
+        self.known_ips.remember(self.username, "192.0.2.2")
+        self.known_ips.remember("SomeoneElse", "192.0.2.1")
+        self.assertEqual(self.known_ips.forget_user(self.username), 2)
+        self.assertFalse(self.known_ips.is_known(self.username, "192.0.2.1"))
+        self.assertFalse(self.known_ips.is_known(self.username, "192.0.2.2"))
+        self.assertTrue(self.known_ips.is_known("SomeoneElse", "192.0.2.1"))
+
+    def test_missing_ip_is_never_known(self):
+        self.known_ips.remember(self.username, None)
+        self.assertFalse(self.known_ips.is_known(self.username, None))
+        self.assertEqual(
+            self.known_ips.ips.count_documents({"username": self.username}), 0
+        )
+
+    def test_old_login_expires(self):
+        self.known_ips.ips.insert_one(
+            {
+                "username": self.username,
+                "ip": "192.0.2.1",
+                "last_success": datetime.now(UTC)
+                - timedelta(days=KNOWN_LOGIN_IP_DAYS + 1),
+            }
+        )
+        self.assertFalse(self.known_ips.is_known(self.username, "192.0.2.1"))
+
+    def test_remember_writes_once_per_refresh_interval(self):
+        self.known_ips.remember(self.username, "192.0.2.1")
+        first = self.known_ips.ips.find_one({"username": self.username})
+        self.known_ips.remember(self.username, "192.0.2.1")
+        second = self.known_ips.ips.find_one({"username": self.username})
+        self.assertEqual(first["last_success"], second["last_success"])
+        self.assertEqual(
+            self.known_ips.ips.count_documents({"username": self.username}), 1
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -46,14 +46,16 @@ Do these steps in `server/`. You can do each step again without risk.
 
    ```bash
    cd server
-   python3 utils/create_indexes.py worker_sessions
+   python3 utils/create_indexes.py worker_sessions known_login_ips password_failures
    ```
 
 3. Stop the old server.
-4. Hash the passwords.
+4. Hash the passwords. Then record the clients that ran tasks in the last
+   30 days as known clients.
 
    ```bash
    .venv/bin/python utils/hash_passwords.py
+   .venv/bin/python utils/seed_known_login_ips.py
    ```
 
 5. Start the new server.
@@ -77,8 +79,8 @@ Keep them secret or delete them.
   sessions release stay valid.
 - A worker older than v330 fails its current task one time. Then it updates
   itself. A worker that cannot update stops until a person updates it.
-- When the server is busy, it sends "try again later" (HTTP 503). The worker
-  tries again after a delay of up to 15 minutes.
+- When the server is busy, it sends "try again later" (HTTP 429 or 503). The
+  worker tries again after a delay of up to 15 minutes.
 
 A session ends when:
 
@@ -88,6 +90,24 @@ A session ends when:
 - The user changes the password.
 - The user has more than `max(2 * machine_limit, 32)` sessions. The oldest
   sessions end first.
+
+#### Password limits
+
+These limits apply to the worker login, the login form and the profile form.
+A client is an IPv4 address or an IPv6 /64 network. A known client logged in
+to the account in the last 30 days.
+
+| Failures | Period | Result |
+|----------|--------|--------|
+| 10 for one username from one client | 60 s | The server rejects this client for this username |
+| 30 from one client | 60 s | The server rejects this client |
+| 10 for one username, or 100 in total | 60 s | Unknown clients wait in a queue (one check each second) |
+| 100 for one username | 24 h | The server rejects unknown clients for this username |
+
+- The queue and the 24-hour limit do not apply to known clients.
+- The limits do not apply to session tokens or to unknown usernames.
+- A password change clears the known clients and the 24-hour count.
+- The values are the `PASSWORD_*` constants in `constants.py`.
 
 ### Primary instance detection
 

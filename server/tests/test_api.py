@@ -15,8 +15,11 @@ import test_support
 from fishtest.run_cache import Prio
 
 try:
+    from fishtest import password_throttle
     from fishtest.api import WORKER_VERSION
     from fishtest.constants import (
+        PASSWORD_PAIR_FAILURE_LIMIT,
+        PASSWORD_USER_DAILY_FAILURE_LIMIT,
         WORKER_SESSION_MAX_AGE_SECONDS,
         WORKER_SESSION_RENEW_SECONDS,
     )
@@ -25,8 +28,11 @@ try:
     from fishtest.util import worker_name
     from fishtest.worker_sessions import hash_session_token
 except ModuleNotFoundError:  # pragma: no cover
+    password_throttle = None  # type: ignore[assignment]
     hash_session_token = None  # type: ignore[assignment]
     WORKER_VERSION = None  # type: ignore[assignment]
+    PASSWORD_PAIR_FAILURE_LIMIT = None  # type: ignore[assignment]
+    PASSWORD_USER_DAILY_FAILURE_LIMIT = None  # type: ignore[assignment]
     WORKER_SESSION_MAX_AGE_SECONDS = None  # type: ignore[assignment]
     WORKER_SESSION_RENEW_SECONDS = None  # type: ignore[assignment]
     hash_password = None  # type: ignore[assignment]
@@ -98,6 +104,7 @@ class TestHttpApi(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        cls.rundb.known_login_ips.forget_user(cls.username)
         test_support.cleanup_test_rundb(
             cls.rundb,
             clear_usernames=[cls.username],
@@ -109,7 +116,10 @@ class TestHttpApi(unittest.TestCase):
     def setUp(self):
         self._reset_runs()
         self._session_token = None
+        password_throttle.reset()
         self.rundb.worker_sessions.delete_for_user(self.username)
+        self.rundb.known_login_ips.forget_user(self.username)
+        self.rundb.known_login_ips._cache.clear()
 
     def _reset_runs(self) -> None:
         self.rundb.runs.delete_many({})
@@ -525,6 +535,26 @@ class TestHttpApi(unittest.TestCase):
             )
             userdb.clear_cache()
 
+    def test_daily_failure_limit_refuses_unknown_clients(self):
+        known_ips = self.rundb.known_login_ips
+        for _ in range(PASSWORD_USER_DAILY_FAILURE_LIMIT):
+            known_ips.count_failure(self.username)
+        calls, patcher = self._count_password_checks()
+        with patcher:
+            response = self.client.post(
+                "/api/request_version",
+                json=self._payload(password=self.password),
+            )
+        self._assert_worker_error_response(
+            response,
+            status_code=429,
+            path="/api/request_version",
+            contains="try again later",
+        )
+        self.assertEqual(calls, [])
+        known_ips.remember(self.username, "testclient")
+        self._login()
+
     def test_session_auth_skips_password_check(self):
         session_token = self._login()
         calls, patcher = self._count_password_checks()
@@ -601,6 +631,27 @@ class TestHttpApi(unittest.TestCase):
 
         return calls, patch.object(userdb, "password_is_correct", counting)
 
+    def test_password_failures_from_one_client_are_rejected(self):
+        calls, patcher = self._count_password_checks()
+        with patcher:
+            for attempt in range(PASSWORD_PAIR_FAILURE_LIMIT):
+                response = self.client.post(
+                    "/api/request_version",
+                    json=self._payload(password=f"wrong-{attempt}"),
+                )
+                self.assertEqual(response.status_code, 401)
+            response = self.client.post(
+                "/api/request_version",
+                json=self._payload(password=self.password),
+            )
+        self._assert_worker_error_response(
+            response,
+            status_code=429,
+            path="/api/request_version",
+            contains="Too many failed password attempts",
+        )
+        self.assertEqual(len(calls), PASSWORD_PAIR_FAILURE_LIMIT)
+
     def test_busy_kdf_answers_503_try_again_later(self):
         from fishtest.password_hash import PasswordHashBusy
 
@@ -618,6 +669,31 @@ class TestHttpApi(unittest.TestCase):
             contains="try again later",
         )
         self.assertNotIn("session_token", body)
+
+    def test_password_login_remembers_client_ip(self):
+        known_ips = self.rundb.known_login_ips
+        self.assertFalse(known_ips.is_known(self.username, "testclient"))
+        response = self.client.post(
+            "/api/request_version",
+            json=self._payload(password="wrong"),
+        )
+        self.assertEqual(response.status_code, 401)
+        self.assertFalse(known_ips.is_known(self.username, "testclient"))
+        self._login()
+        self.assertTrue(known_ips.is_known(self.username, "testclient"))
+
+    def test_session_auth_unaffected_by_password_throttle(self):
+        session_token = self._login()
+        for attempt in range(PASSWORD_PAIR_FAILURE_LIMIT):
+            self.client.post(
+                "/api/request_version",
+                json=self._payload(password=f"wrong-{attempt}"),
+            )
+        response = self.client.post(
+            "/api/request_version",
+            json=self._session_payload(session_token=session_token),
+        )
+        self.assertEqual(response.status_code, 200)
 
     def test_worker_endpoints_missing_worker_info_is_validation_error(self):
         endpoints = [

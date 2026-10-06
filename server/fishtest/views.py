@@ -33,6 +33,7 @@ from vtjson import ValidationError, union, validate
 
 import fishtest.github_api as gh
 import fishtest.stats.stat_util
+from fishtest import password_throttle
 from fishtest.http.boundary import (
     build_template_context,
     commit_session_response,
@@ -686,7 +687,7 @@ def login(request: _ViewContext) -> dict[str, Any] | RedirectResponse:
 
         username = _form_string_value(request.POST, "username").strip()
         password = _form_string_value(request.POST, "password").strip()
-        token = request.userdb.authenticate(username, password)
+        token = _throttled_authenticate(request, username, password)
         if "error" not in token:
             if remember_me_checked:
                 remember(request, username, max_age=SESSION_REMEMBER_ME_MAX_AGE_SECONDS)
@@ -710,6 +711,48 @@ def login(request: _ViewContext) -> dict[str, Any] | RedirectResponse:
         "remember_me_checked": remember_me_checked,
         "remember_me_cookie_name": LOGIN_REMEMBER_ME_COOKIE_NAME,
     }
+
+
+PASSWORD_THROTTLED_MESSAGE = (
+    "Too many failed login attempts, please try again in a few minutes."
+)
+
+
+def _throttled_authenticate(
+    request: _ViewContext, username: str, password: str
+) -> dict[str, Any]:
+    """Run ``UserDb.authenticate`` under the password throttle."""
+    if request.userdb.get_user(username) is None:
+        # Unknown usernames cost no KDF work, so they are not counted.
+        return request.userdb.authenticate(username, password)
+    token: dict[str, Any] = {}
+
+    def attempt() -> bool:
+        token.update(request.userdb.authenticate(username, password))
+        return token.get("error_code") != "invalid_credentials"
+
+    try:
+        password_throttle.check(
+            username, request.remote_addr, request.rundb.known_login_ips, attempt
+        )
+    except password_throttle.PasswordThrottled:
+        return {"error": PASSWORD_THROTTLED_MESSAGE, "error_code": "throttled"}
+    return token
+
+
+def _throttled_password_check(
+    request: _ViewContext, username: str, password: str
+) -> bool | None:
+    """Check ``password`` under the password throttle; None if throttled."""
+    try:
+        return password_throttle.check(
+            username,
+            request.remote_addr,
+            request.rundb.known_login_ips,
+            lambda: request.userdb.password_is_correct(username, password),
+        )
+    except password_throttle.PasswordThrottled:
+        return None
 
 
 def logout(request: _ViewContext) -> RedirectResponse:
@@ -1714,7 +1757,11 @@ def user(request: _ViewContext) -> dict[str, Any] | RedirectResponse:  # noqa: C
             tests_repo = _form_string_value(request.POST, "tests_repo").strip()
             password_changed = False
 
-            if not request.userdb.password_is_correct(user_name, old_password):
+            password_ok = _throttled_password_check(request, user_name, old_password)
+            if password_ok is None:
+                request.session.flash(PASSWORD_THROTTLED_MESSAGE, "error")
+                return home(request)
+            if not password_ok:
                 request.session.flash("Invalid password!", "error")
                 return home(request)
 
@@ -1766,6 +1813,7 @@ def user(request: _ViewContext) -> dict[str, Any] | RedirectResponse:  # noqa: C
             request.userdb.save_user(user_data)
             if password_changed:
                 request.rundb.worker_sessions.delete_for_user(user_name)
+                request.rundb.known_login_ips.forget_user(user_name)
                 forget(request)
                 request.session.invalidate()
                 request.session.flash(

@@ -13,6 +13,7 @@ from starlette.responses import JSONResponse, RedirectResponse, StreamingRespons
 from vtjson import ValidationError, validate
 
 import fishtest.github_api as gh
+from fishtest import password_throttle
 from fishtest.constants import (
     WORKER_SESSION_MAX_AGE_SECONDS,
     WORKER_SESSION_RENEW_SECONDS,
@@ -146,13 +147,25 @@ class WorkerApi(GenericApi):
         # Another process may have changed the password or the account status
         # within the lifetime of the cached record.
         user = userdb.get_user(username, fresh=True)
+        # Unknown usernames are not counted by the throttle: they cost no KDF.
         password = self.request_body.get("password", "")
-        password_ok = (
-            bool(password)
-            and user is not None
-            and bool(user.get("password"))
-            and userdb.password_is_correct(username, password)
-        )
+        try:
+            password_ok = (
+                bool(password)
+                and user is not None
+                and bool(user.get("password"))
+                and password_throttle.check(
+                    username,
+                    self.request.remote_addr,
+                    self.request.rundb.known_login_ips,
+                    lambda: userdb.password_is_correct(username, password),
+                )
+            )
+        except password_throttle.PasswordThrottled:
+            self.handle_error(
+                "Too many failed password attempts, try again later.",
+                status_code=429,
+            )
         if not password_ok:
             self.handle_error("Invalid username or password.", status_code=401)
         status_error = userdb._account_status_error(user, username)

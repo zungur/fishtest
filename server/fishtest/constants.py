@@ -38,6 +38,37 @@ SCRYPT_MAX_CONCURRENCY = 4
 SCRYPT_MAX_WAITERS = 16
 SCRYPT_SLOT_WAIT_SECONDS = 5.0
 
+# Password logins (worker API, web login, profile changes). Failed checks are
+# counted per (username, client), per client, per username and in total, in
+# fixed windows starting at the first failure. A client is an IPv4 address or
+# an IPv6 /64 network. A client over its (username, client) or client limit is
+# rejected without running the KDF. A username over its limit, or the total
+# over its limit, never causes a rejection by itself: password checks from
+# clients not known for that username wait in a paced queue instead. These
+# counts are kept in memory, per process.
+PASSWORD_FAILURE_WINDOW_SECONDS = 60
+PASSWORD_PAIR_FAILURE_LIMIT = 10
+PASSWORD_IP_FAILURE_LIMIT = 30
+PASSWORD_USER_FAILURE_LIMIT = 10
+PASSWORD_GLOBAL_FAILURE_LIMIT = 100
+PASSWORD_IPV6_PREFIX = 64
+# Queued checks start at most this often, at most this many requests wait
+# (each holds a server thread), and a request waits at most this long (with
+# SCRYPT_SLOT_WAIT_SECONDS, well below the worker's 30 s HTTP timeout).
+PASSWORD_QUEUE_INTERVAL_SECONDS = 1.0
+PASSWORD_QUEUE_MAX_WAITERS = 8
+PASSWORD_QUEUE_MAX_WAIT_SECONDS = 15.0
+# Failed checks per username are also counted in MongoDB, shared by all
+# processes, in fixed windows starting at the first failure. Over the limit,
+# only clients known for that username get a password check, until the window
+# ends or the password is changed.
+PASSWORD_USER_DAILY_FAILURE_LIMIT = 100
+PASSWORD_DAILY_FAILURE_WINDOW_SECONDS = 24 * 3600
+# A client stays known for a user this long after a successful password
+# login from it; the record is refreshed at most this often.
+KNOWN_LOGIN_IP_DAYS = 30
+KNOWN_LOGIN_IP_REFRESH_SECONDS = 3600
+
 supported_compilers = ["clang++", "g++"]
 
 supported_arches = [

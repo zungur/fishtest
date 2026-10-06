@@ -18,6 +18,58 @@ from fishtest.util import PASSWORD_MAX_LENGTH
 class TestUsers(UiUserTestCase):
     username = "TestAuthUser"
 
+    def setUp(self):
+        from fishtest import password_throttle
+
+        super().setUp()
+        password_throttle.reset()
+        self.addCleanup(password_throttle.reset)
+        self.rundb.known_login_ips.forget_user(self.username)
+        self.rundb.known_login_ips._cache.clear()
+
+    def _post_login(self, password, username=None):
+        response = self.client.get("/login")
+        csrf = test_support.extract_csrf_token(response.text)
+        return self.client.post(
+            "/login",
+            data={
+                "username": username or self.username,
+                "password": password,
+                "csrf_token": csrf,
+            },
+            follow_redirects=True,
+        )
+
+    def _is_logged_in(self):
+        response = self.client.get("/user", follow_redirects=False)
+        return response.status_code == 200
+
+    def test_web_login_failures_are_throttled(self):
+        from fishtest.constants import PASSWORD_PAIR_FAILURE_LIMIT
+
+        for attempt in range(PASSWORD_PAIR_FAILURE_LIMIT):
+            response = self._post_login(f"wrong-{attempt}")
+            self.assertIn("Invalid username or password", response.text)
+        with patch("fishtest.userdb.verify_password") as verify:
+            response = self._post_login(self.password)
+        verify.assert_not_called()
+        self.assertIn("Too many failed login attempts", response.text)
+        self.assertFalse(self._is_logged_in())
+
+    def test_web_login_unknown_usernames_are_not_counted(self):
+        from fishtest.constants import PASSWORD_IP_FAILURE_LIMIT
+
+        for attempt in range(PASSWORD_IP_FAILURE_LIMIT + 5):
+            self._post_login("whatever", username=f"NoSuchUser{attempt}")
+        self._post_login(self.password)
+        self.assertTrue(self._is_logged_in())
+
+    def test_web_login_remembers_client(self):
+        self._login_user()
+        self.assertTrue(
+            self.rundb.known_login_ips.is_known(self.username, "testclient")
+        )
+
     def test_web_login_busy_kdf_answers_503(self):
         from fishtest.password_hash import PasswordHashBusy
 
@@ -35,6 +87,34 @@ class TestUsers(UiUserTestCase):
             )
         self.assertEqual(response.status_code, 503)
         self.assertIn("Server busy", response.text)
+
+    def test_profile_password_check_is_throttled(self):
+        from fishtest.constants import PASSWORD_PAIR_FAILURE_LIMIT
+
+        self._login_user()
+        user = self.rundb.userdb.get_user(self.username)
+
+        def post_profile(old_password):
+            response = self.client.get("/user")
+            csrf = test_support.extract_csrf_token(response.text)
+            return self.client.post(
+                "/user",
+                data={
+                    "user": self.username,
+                    "old_password": old_password,
+                    "password": "",
+                    "password2": "",
+                    "email": "",
+                    "tests_repo": user["tests_repo"],
+                    "csrf_token": csrf,
+                },
+                follow_redirects=True,
+            )
+
+        for attempt in range(PASSWORD_PAIR_FAILURE_LIMIT):
+            self.assertIn("Invalid password!", post_profile(f"wrong-{attempt}").text)
+        response = post_profile(self.password)
+        self.assertIn("Too many failed login attempts", response.text)
 
     def _assert_no_store_headers(self, response):
         self.assertEqual(response.headers.get("Cache-Control"), "no-store")
@@ -658,6 +738,7 @@ class TestUsers(UiUserTestCase):
         self._login_user()
         user = self.rundb.userdb.get_user(self.username)
         session_token = self._create_worker_session()
+        self.rundb.known_login_ips.remember(self.username, "203.0.113.7")
 
         response = self.client.get("/user")
         csrf = test_support.extract_csrf_token(response.text)
@@ -680,6 +761,9 @@ class TestUsers(UiUserTestCase):
             self.assertTrue(response.headers.get("location", "").startswith("/login"))
             self.assertEqual(self._worker_session_count(), 0)
             updated = self.rundb.userdb.get_user(self.username)
+            self.assertFalse(
+                self.rundb.known_login_ips.is_known(self.username, "203.0.113.7")
+            )
             self.assertFalse(
                 self.rundb.worker_sessions.validate(
                     self.username,
