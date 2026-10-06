@@ -15,16 +15,23 @@
 |----------|----------|---------|-------------|
 | `FISHTEST_PORT` | Yes | `-1` | Port for this instance |
 | `FISHTEST_PRIMARY_PORT` | Yes | `-1` | Fixed primary port (typically 8000) |
-| `FISHTEST_URL` | Dev: No; Prod: Yes | -- | Public URL (e.g., `https://tests.stockfishchess.org`); may be empty in development for dynamic host/IP |
+| `FISHTEST_URL` | Dev: No; Prod: Yes | -- | Public URL (e.g., `https://tests.stockfishchess.org`); may be empty in development for dynamic host/IP. Password reset emails are not sent without it (outside `FISHTEST_INSECURE_DEV`) |
 | `FISHTEST_NN_URL` | No | (unset => request host; empty => same-host) | Base URL workers use to download neural networks (see below) |
 | `FISHTEST_AUTHENTICATION_SECRET` | Yes | -- | Cookie signing secret (itsdangerous) |
-| `FISHTEST_CAPTCHA_SECRET` | No | -- | reCAPTCHA secret key for signup |
-| `FISHTEST_CAPTCHA_SITE_KEY` | No | built-in | reCAPTCHA site key for signup |
+| `FISHTEST_CAPTCHA_SECRET` | Signup and password reset: Yes | -- | reCAPTCHA secret key for the signup and forgot-password forms |
+| `FISHTEST_CAPTCHA_SITE_KEY` | No | built-in | reCAPTCHA site key for the signup and forgot-password forms |
 | `FISHTEST_INSECURE_DEV` | No | -- | Set to `1` for development mode (insecure secret) |
 | `FISHTEST_JINJA_TEMPLATES_DIR` | No | auto | Override Jinja2 templates directory |
 | `OPENAPI_URL` | No | (empty) | Set to `/openapi.json` to enable `/docs` and `/redoc` (development-only) |
 | `UVICORN_WORKERS` | No | -- | Must be `1` on primary (enforced at startup) |
 | `WEB_CONCURRENCY` | No | -- | Fallback for `UVICORN_WORKERS` (checked if unset) |
+| `FISHTEST_SMTP_HOST` | Password reset: Yes | -- | SMTP relay host |
+| `FISHTEST_SMTP_PORT` | No | `587` | SMTP port (`465` uses implicit TLS) |
+| `FISHTEST_SMTP_USERNAME` | No | -- | SMTP auth username |
+| `FISHTEST_SMTP_PASSWORD` | No | -- | SMTP auth password |
+| `FISHTEST_SMTP_FROM_EMAIL` | Password reset: Yes | -- | From address for transactional email |
+| `FISHTEST_SMTP_FROM_NAME` | No | `Fishtest` | From display name |
+| `FISHTEST_SMTP_USE_TLS` | No | `true` | STARTTLS on non-465 ports |
 
 **Session invalidation**: deploying a new `FISHTEST_AUTHENTICATION_SECRET`
 invalidates all existing sessions. Users must re-authenticate once.
@@ -46,7 +53,7 @@ Do these steps in `server/`. You can do each step again without risk.
 
    ```bash
    cd server
-   python3 utils/create_indexes.py worker_sessions known_login_ips password_failures
+   python3 utils/create_indexes.py users worker_sessions known_login_ips password_failures
    ```
 
 3. Stop the old server.
@@ -69,14 +76,33 @@ then, each login hashes the password of its account.
 **CAUTION:** Backups from before the migration contain plaintext passwords.
 Keep them secret or delete them.
 
+#### Duplicate email addresses
+
+The `users` index makes email addresses unique (letter case is ignored). If two
+accounts have the same address, `create_indexes.py` does not create this index.
+It shows a message and creates the other indexes. To correct this:
+
+1. List the shared addresses. This script does not change data.
+
+   ```bash
+   .venv/bin/python utils/find_duplicate_emails.py
+   ```
+
+2. For each address, select the account that keeps it. If necessary, ask the
+   owners.
+3. Change the email address of the other accounts.
+4. Run `create_indexes.py users` again.
+
+Until you do these steps, signup and the profile form reject an address that
+another account uses.
+
 #### Worker sessions
 
 - Contributors do not change their configuration. The worker reads the
   password from `fishtest.cfg`.
 - The server keeps only the sha256 digest of each session token.
 - At the cutover, each v330 worker logs in one time. MongoDB keeps the
-  sessions, thus later restarts do not cause logins. Sessions from the worker
-  sessions release stay valid.
+  sessions, thus later restarts do not cause logins.
 - A worker older than v330 fails its current task one time. Then it updates
   itself. A worker that cannot update stops until a person updates it.
 - When the server is busy, it sends "try again later" (HTTP 429 or 503). The
@@ -87,7 +113,7 @@ A session ends when:
 - The worker stops or updates.
 - The session is not used for 24 hours.
 - The session is 30 days old.
-- The user changes the password.
+- The user changes or resets the password.
 - The user has more than `max(2 * machine_limit, 32)` sessions. The oldest
   sessions end first.
 
@@ -106,8 +132,17 @@ to the account in the last 30 days.
 
 - The queue and the 24-hour limit do not apply to known clients.
 - The limits do not apply to session tokens or to unknown usernames.
-- A password change clears the known clients and the 24-hour count.
+- A password change or reset clears the known clients and the 24-hour count.
 - The values are the `PASSWORD_*` constants in `constants.py`.
+
+#### Password reset
+
+- The forgot-password form has a captcha.
+- The reply is the same for all addresses.
+- An account gets a maximum of one reset email in 10 minutes.
+- A link is valid for 1 hour. When a user sets a password with one link, all
+  links of the account stop working.
+- A password or email change on the profile form cancels the links.
 
 ### Primary instance detection
 
@@ -386,6 +421,13 @@ map $uri $backends {
     default                                backend_8001;
 }
 
+# Keep a stricter Referrer-Policy set by the application (the password reset
+# page sends "no-referrer"); use the site default otherwise.
+map $upstream_http_referrer_policy $referrer_policy {
+    ""       "strict-origin-when-cross-origin";
+    default  $upstream_http_referrer_policy;
+}
+
 server {
     listen      443 ssl;
     listen [::]:443 ssl;
@@ -404,7 +446,7 @@ server {
     add_header Strict-Transport-Security  "max-age=63072000; includeSubDomains; preload" always;
     add_header X-Content-Type-Options     "nosniff" always;
     add_header X-Frame-Options            "SAMEORIGIN" always;
-    add_header Referrer-Policy            "strict-origin-when-cross-origin" always;
+    add_header Referrer-Policy            $referrer_policy always;
     add_header Permissions-Policy         "camera=(), microphone=(), geolocation=()" always;
 
     # block bad actors at the server level (early access phase)
@@ -454,6 +496,9 @@ server {
 
         # Custom metadata
         proxy_set_header X-Country-Code     $region;
+
+        # Sent once, by the server-level add_header (see $referrer_policy)
+        proxy_hide_header        Referrer-Policy;
 
         # Timeouts
         proxy_connect_timeout    2s;
@@ -623,8 +668,19 @@ http {
     include            /etc/nginx/mime.types;
     default_type       application/octet-stream;
 
-    log_format  main   '$remote_addr - $remote_user [$time_local] "$request" '
-                       '$status $body_bytes_sent "$http_referer" '
+    # Password reset links carry a secret token in the path: keep it out of
+    # the access log (request line and Referer).
+    map $request $request_redacted {
+        "~^(?<rq_head>\S+ /reset_password/)[^ ?]+(?<rq_tail>.*)$"  "${rq_head}REDACTED${rq_tail}";
+        default                                                   $request;
+    }
+    map $http_referer $referer_redacted {
+        "~^(?<rf_head>.*/reset_password/)[^?#]+(?<rf_tail>.*)$"     "${rf_head}REDACTED${rf_tail}";
+        default                                                   $http_referer;
+    }
+
+    log_format  main   '$remote_addr - $remote_user [$time_local] "$request_redacted" '
+                       '$status $body_bytes_sent "$referer_redacted" '
                        '"$http_user_agent" "$http_x_forwarded_for" $upstream_response_time';
 
     access_log         /var/log/nginx/access.log  main;

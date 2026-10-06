@@ -125,12 +125,21 @@ pgns_schema = intersect(
     size_is_length,
 )
 
+password_reset_schema = {
+    # sha256 digest of the emailed token; the raw token is never stored.
+    "token": sha256_hex,
+    "expires_at": datetime_utc,
+    "created": datetime_utc,
+}
+
 user_schema = {
     "_id?": ObjectId,
     "username": username,
     # Either a legacy plaintext password (upgraded lazily on next login) or a
     # scrypt hash produced by fishtest.password_hash.
     "password": union(intersect(str, size(0, PASSWORD_MAX_LENGTH)), scrypt_hash),
+    # Outstanding password reset tokens, oldest first; using one consumes all.
+    "password_reset?": [password_reset_schema, ...],
     "registration_time": datetime_utc,
     "pending": bool,
     "blocked": bool,
@@ -138,7 +147,7 @@ user_schema = {
     "groups": intersect([str, ...], unique),
     "tests_repo": union(github_repo, ""),
     "machine_limit": uint,
-    # Bumped on password change to invalidate web and worker sessions.
+    # Bumped on password change or reset to invalidate web and worker sessions.
     "credentials_version?": uint,
 }
 

@@ -3,7 +3,7 @@
 Only the sha256 digest of a token is stored. A session is valid while it is
 younger than the idle window (refreshed by use) and the maximum age, belongs
 to the presented username, and carries the user's current
-``credentials_version`` (bumped on password change). Idle records are
+``credentials_version`` (bumped on password change or reset). Idle records are
 removed by a TTL index on ``last_seen`` (see ``utils/create_indexes.py``).
 
 ``KnownLoginIpDb`` remembers which clients (see

@@ -9,6 +9,7 @@ import pprint
 import sys
 
 from pymongo import ASCENDING, DESCENDING, MongoClient
+from pymongo.errors import OperationFailure
 
 from fishtest.constants import (
     KNOWN_LOGIN_IP_DAYS,
@@ -16,6 +17,7 @@ from fishtest.constants import (
     WORKER_SESSION_IDLE_SECONDS,
 )
 from fishtest.rundb import RunDb
+from fishtest.userdb import EMAIL_COLLATION
 
 db_name = "fishtest_new"
 
@@ -109,6 +111,25 @@ def create_nns_indexes():
 
 def create_users_indexes():
     db["users"].create_index("username", unique=True)
+    db["users"].create_index(
+        "password_reset.token",
+        name="password_reset_token",
+        sparse=True,
+    )
+    try:
+        db["users"].create_index(
+            "email",
+            name="users_email_unique",
+            unique=True,
+            collation=EMAIL_COLLATION,
+        )
+    except OperationFailure as e:
+        print(
+            "Could not create the unique email index, probably because several "
+            f"accounts share an email address ({e}).\n"
+            "Run utils/find_duplicate_emails.py, resolve the duplicates, and "
+            "run this script for the users collection again."
+        )
 
 
 def create_workers_indexes():

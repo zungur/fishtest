@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import functools
 import gzip
 import hashlib
 import logging
 import os
 import re
+import secrets
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -25,6 +27,7 @@ import regex
 import requests
 from fastapi import APIRouter
 from markupsafe import Markup
+from pymongo.errors import DuplicateKeyError
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request  # noqa: TC002
@@ -34,6 +37,10 @@ from vtjson import ValidationError, union, validate
 import fishtest.github_api as gh
 import fishtest.stats.stat_util
 from fishtest import password_throttle
+from fishtest.constants import (
+    PASSWORD_RESET_EXPIRY_HOURS,
+    PASSWORD_RESET_RESEND_SECONDS,
+)
 from fishtest.http.boundary import (
     build_template_context,
     commit_session_response,
@@ -42,12 +49,15 @@ from fishtest.http.boundary import (
     remember,
 )
 from fishtest.http.cookie_session import (
+    INSECURE_DEV_ENV,
     CookieSession,
     authenticated_user,
 )
 from fishtest.http.csrf import csrf_token_from_form
 from fishtest.http.dependencies import (
+    DependencyNotInitializedError,
     get_actiondb,
+    get_email_sender,
     get_request_context,
     get_rundb,
     get_userdb,
@@ -462,6 +472,12 @@ class _ViewContext:
             self.actiondb = context["actiondb"]
             self.workerdb = context["workerdb"]
 
+        # Application-level service (not request-scoped); may be unconfigured.
+        try:
+            self.email_sender = get_email_sender(request)
+        except DependencyNotInitializedError:
+            self.email_sender = None
+
     @property
     def authenticated_userid(self) -> str | None:
         username = authenticated_user(self.session)
@@ -716,6 +732,7 @@ def login(request: _ViewContext) -> dict[str, Any] | RedirectResponse:
 PASSWORD_THROTTLED_MESSAGE = (
     "Too many failed login attempts, please try again in a few minutes."
 )
+EMAIL_IN_USE_MESSAGE = "Error! That email is already used by another account"
 
 
 def _throttled_authenticate(
@@ -867,6 +884,203 @@ def signup(request: _ViewContext) -> dict[str, Any] | RedirectResponse:  # noqa:
         )
         return RedirectResponse(url="/login", status_code=302)
     return signup_context
+
+
+# === Password Reset ===
+PASSWORD_RESET_GENERIC_MESSAGE = (
+    "If that email is registered, a password reset link has been sent. "
+    f"A new link is sent at most every {PASSWORD_RESET_RESEND_SECONDS // 60} "
+    "minutes; links already sent stay valid."
+)
+PASSWORD_RESET_INVALID_MESSAGE = "This password reset link is invalid or has expired."
+PASSWORD_RESET_DEV_DELIVERY_FAILED_MESSAGE = (
+    "Dev notice: password reset email was not sent (configure SMTP or check logs)."
+)
+
+
+def _insecure_dev_enabled() -> bool:
+    return os.environ.get(INSECURE_DEV_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _password_reset_base_url(request: _ViewContext) -> str | None:
+    """Return the trusted origin for emailed reset links, or None if unknown.
+
+    The request Host header is client-controlled, so it is only trusted in
+    insecure dev mode.
+    """
+    configured = os.environ.get("FISHTEST_URL", "").strip().rstrip("/")
+    if configured:
+        return configured
+    if _insecure_dev_enabled():
+        return _host_url(request)
+    return None
+
+
+def _hash_reset_token(token: str) -> str:
+    """Return the sha256 digest stored in the db for a raw reset token."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _verify_recaptcha(request: _ViewContext) -> str | None:
+    """Return an error message if the captcha is missing/invalid, else None."""
+    secret = os.environ.get("FISHTEST_CAPTCHA_SECRET", "").strip()
+    captcha_response = _form_string_value(
+        request.POST,
+        "g-recaptcha-response",
+    ).strip()
+    if not secret:
+        return "Captcha configuration is missing"
+    if not captcha_response:
+        return "Captcha required"
+    payload = {
+        "secret": secret,
+        "response": captcha_response,
+        "remoteip": request.remote_addr,
+    }
+    try:
+        response = requests.post(
+            "https://www.google.com/recaptcha/api/siteverify",
+            data=payload,
+            timeout=HTTP_TIMEOUT,
+        ).json()
+    except requests.RequestException, ValueError:
+        return "Captcha verification failed"
+    if "success" not in response or not response["success"]:
+        if "error-codes" in response:
+            logger.warning(response["error-codes"])
+        return "Captcha failed"
+    return None
+
+
+def forgot_password(request: _ViewContext) -> dict[str, Any] | RedirectResponse:
+    _append_no_store_headers(request)
+    if request.authenticated_userid:
+        return home(request)
+
+    recaptcha_site_key = os.environ.get(
+        "FISHTEST_CAPTCHA_SITE_KEY",
+        DEFAULT_RECAPTCHA_SITE_KEY,
+    ).strip()
+    context = {"recaptcha_site_key": recaptcha_site_key}
+
+    if request.method != "POST":
+        return context
+
+    captcha_error = _verify_recaptcha(request)
+    if captcha_error is not None:
+        request.session.flash(captcha_error, "error")
+        return context
+
+    email = _form_string_value(request.POST, "email").strip()
+
+    # The captcha above limits automated submissions. Respond identically whether or not the email exists (no enumeration):
+    # only checks that do not depend on the account run here, and the user
+    # lookup, token and SMTP delivery happen on the background email thread.
+    email_is_valid, validated_email = email_valid(email)
+    base_url = _password_reset_base_url(request)
+    sender = request.email_sender
+    delivery_failed = False
+    if base_url is None:
+        delivery_failed = True
+        logger.error("Password reset requested but FISHTEST_URL is not configured")
+    elif sender is None or not sender.is_configured:
+        delivery_failed = True
+        logger.error("Password reset requested but email sending is not configured")
+    elif email_is_valid and not sender.send_in_background(
+        functools.partial(
+            _compose_password_reset_emails, request.userdb, validated_email, base_url
+        )
+    ):
+        delivery_failed = True
+
+    request.session.flash(PASSWORD_RESET_GENERIC_MESSAGE)
+    if delivery_failed and _insecure_dev_enabled():
+        request.session.flash(PASSWORD_RESET_DEV_DELIVERY_FAILED_MESSAGE, "warning")
+    return RedirectResponse(url="/login", status_code=302)
+
+
+def _compose_password_reset_emails(
+    userdb: Any, email: str, base_url: str
+) -> list[tuple[str, str, str]]:
+    """Store reset tokens for the accounts using ``email`` and build the emails.
+
+    Runs on the background email thread. Returns no emails for unknown
+    addresses or accounts that got a link recently, and one per account
+    while duplicate addresses remain.
+    """
+    messages = []
+    for user in userdb.find_all_by_email(email):
+        raw_token = secrets.token_urlsafe(32)
+        expires_at = datetime.now(UTC) + timedelta(hours=PASSWORD_RESET_EXPIRY_HOURS)
+        if not userdb.add_password_reset(
+            user["_id"], _hash_reset_token(raw_token), expires_at
+        ):
+            continue
+        reset_url = f"{base_url}/reset_password/{raw_token}"
+        body = (
+            "We received a request to reset the password of the Fishtest "
+            f"account {user['username']}.\n\n"
+            f"Reset link: {reset_url}\n\n"
+            f"This link expires in {PASSWORD_RESET_EXPIRY_HOURS} hour(s). Once "
+            "you set a new password, it and any other reset links stop "
+            "working.\n\n"
+            "If you did not request a password reset you can safely ignore "
+            "this email."
+        )
+        messages.append((user["email"], "Fishtest password reset", body))
+    return messages
+
+
+def reset_password(request: _ViewContext) -> dict[str, Any] | RedirectResponse:
+    _append_no_store_headers(request)
+    # The token is in the URL path; keep it out of Referer headers.
+    request.response_headerlist.append(("Referrer-Policy", "no-referrer"))
+    token = request.matchdict.get("token", "")
+    token_hash = _hash_reset_token(token)
+
+    # Opening the link only validates the token (mail scanners prefetch links);
+    # it is consumed atomically together with the password update on POST.
+    user = request.userdb.find_by_reset_token(token_hash)
+    if user is None:
+        request.session.flash(PASSWORD_RESET_INVALID_MESSAGE, "error")
+        return RedirectResponse(url="/login", status_code=302)
+
+    if request.method != "POST":
+        return {"token": token}
+
+    new_password = _form_string_value(request.POST, "password").strip()
+    new_password_verify = _form_string_value(request.POST, "password2").strip()
+    if new_password != new_password_verify:
+        request.session.flash("Error! Matching verify password required", "error")
+        return {"token": token}
+
+    strong_password, password_err = password_strength(
+        new_password,
+        user["username"],
+        user["email"],
+    )
+    if not strong_password:
+        request.session.flash(password_err, "error")
+        return {"token": token}
+
+    result = request.userdb.update_password_with_reset_token(
+        user["_id"],
+        token_hash,
+        hash_password(new_password),
+    )
+    if not result.modified_count:
+        request.session.flash(PASSWORD_RESET_INVALID_MESSAGE, "error")
+        return RedirectResponse(url="/login", status_code=302)
+    request.rundb.worker_sessions.delete_for_user(user["username"])
+    request.rundb.known_login_ips.forget_user(user["username"])
+
+    request.session.flash("Success! Your password has been updated. Please log in.")
+    return RedirectResponse(url="/login", status_code=302)
 
 
 # === Lists ===
@@ -1800,6 +2014,7 @@ def user(request: _ViewContext) -> dict[str, Any] | RedirectResponse:  # noqa: C
 
             user_data["tests_repo"] = tests_repo
 
+            email_changed = False
             if len(new_email) > 0 and user_data["email"] != new_email:
                 email_is_valid, validated_email = email_valid(new_email)
                 if not email_is_valid:
@@ -1808,9 +2023,23 @@ def user(request: _ViewContext) -> dict[str, Any] | RedirectResponse:  # noqa: C
                         "error",
                     )
                     return home(request)
+                other_user = request.userdb.find_by_email(validated_email)
+                if other_user is not None and other_user["_id"] != user_data["_id"]:
+                    request.session.flash(EMAIL_IN_USE_MESSAGE, "error")
+                    return home(request)
                 user_data["email"] = validated_email
+                email_changed = True
+            if password_changed or email_changed:
+                # Links mailed earlier, possibly to the old address, must not
+                # outlive the credentials they were meant to recover.
+                user_data.pop("password_reset", None)
+            try:
+                request.userdb.save_user(user_data)
+            except DuplicateKeyError:
+                request.session.flash(EMAIL_IN_USE_MESSAGE, "error")
+                return home(request)
+            if email_changed:
                 request.session.flash("Success! Email updated")
-            request.userdb.save_user(user_data)
             if password_changed:
                 request.rundb.worker_sessions.delete_for_user(user_name)
                 request.rundb.known_login_ips.forget_user(user_name)
@@ -3807,6 +4036,24 @@ _VIEW_ROUTES: list[_ViewRoute] = [
         "/signup",
         {
             "renderer": "signup.html.j2",
+            "require_csrf": True,
+            "request_method": ("GET", "POST"),
+        },
+    ),
+    (
+        forgot_password,
+        "/forgot_password",
+        {
+            "renderer": "forgot_password.html.j2",
+            "require_csrf": True,
+            "request_method": ("GET", "POST"),
+        },
+    ),
+    (
+        reset_password,
+        "/reset_password/{token}",
+        {
+            "renderer": "reset_password.html.j2",
             "require_csrf": True,
             "request_method": ("GET", "POST"),
         },

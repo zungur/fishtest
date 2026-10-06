@@ -8,7 +8,7 @@ with the hash and can be upgraded transparently:
 Workers pay the scrypt cost only when they log in for a session; afterwards
 they present a random session token that is checked with a cheap lookup (see
 ``fishtest.worker_sessions``). Otherwise only interactive flows (web login,
-signup, password change) pay the scrypt cost.
+signup, password change, password reset) pay the scrypt cost.
 """
 
 from __future__ import annotations

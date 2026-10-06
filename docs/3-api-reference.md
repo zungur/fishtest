@@ -106,7 +106,7 @@ Only `POST /api/request_version` accepts `password` instead: a valid password
 with `"new_session": true` creates a session. The server stores the sha256
 digest of the token, and the session stays valid until the worker logs out,
 it is idle for 24 hours, it is 30 days old (29 days for `request_version`), or
-the user changes the password. A
+the user changes or resets the password. A
 rejected session token gets HTTP 401; the worker then logs in again with the
 password. Workers older than v330, which send the password with every
 request, get HTTP 401 ("please update your worker") on every other endpoint;

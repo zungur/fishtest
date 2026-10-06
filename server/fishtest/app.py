@@ -29,6 +29,7 @@ from starlette.staticfiles import StaticFiles
 import fishtest.github_api as gh
 from fishtest import schemas
 from fishtest.api import router as api_router
+from fishtest.emailer import EmailSender
 from fishtest.http.cookie_session import (
     DEFAULT_SAMESITE,
     SESSION_COOKIE_NAME,
@@ -156,6 +157,7 @@ def create_app() -> FastAPI:
         app.state.userdb = rundb.userdb
         app.state.actiondb = rundb.actiondb
         app.state.workerdb = rundb.workerdb
+        app.state.email_sender = EmailSender.from_env()
 
         _install_sigusr1_thread_dump_handler()
 
@@ -175,6 +177,10 @@ def create_app() -> FastAPI:
         try:
             yield
         finally:
+            try:
+                await run_in_threadpool(app.state.email_sender.close, 5.0)
+            except Exception:
+                logger.exception("Shutdown: error flushing background email")
             await _shutdown_rundb(rundb)
 
     # OpenAPI docs are disabled in production (openapi_url defaults to None).

@@ -6,7 +6,7 @@ VALID_USERNAME_PATTERN = "[A-Za-z0-9]{2,}"
 # Worker sessions. A worker exchanges its password for a random session token
 # once per run, so the password KDF does not run on every API call. Sessions
 # end on logout, after this much inactivity, at this age, or on a password
-# change.
+# change/reset.
 WORKER_SESSION_IDLE_SECONDS = 24 * 3600
 WORKER_SESSION_MAX_AGE_SECONDS = 30 * 24 * 3600
 # /api/request_version, called before every task, refuses sessions this close
@@ -61,13 +61,25 @@ PASSWORD_QUEUE_MAX_WAIT_SECONDS = 15.0
 # Failed checks per username are also counted in MongoDB, shared by all
 # processes, in fixed windows starting at the first failure. Over the limit,
 # only clients known for that username get a password check, until the window
-# ends or the password is changed.
+# ends or the password is changed or reset.
 PASSWORD_USER_DAILY_FAILURE_LIMIT = 100
 PASSWORD_DAILY_FAILURE_WINDOW_SECONDS = 24 * 3600
 # A client stays known for a user this long after a successful password
 # login from it; the record is refreshed at most this often.
 KNOWN_LOGIN_IP_DAYS = 30
 KNOWN_LOGIN_IP_REFRESH_SECONDS = 3600
+
+# Password reset tokens: short-lived, single-use, delivered by email and
+# stored only as a sha256 digest.
+PASSWORD_RESET_EXPIRY_HOURS = 1
+# A reset link is emailed to an account at most this often. Earlier links stay
+# valid, so requests by someone else can neither block nor cancel the owner's
+# reset.
+PASSWORD_RESET_RESEND_SECONDS = 600
+# Enough to keep every link emailed within the expiry window valid.
+PASSWORD_RESET_MAX_TOKENS = (
+    PASSWORD_RESET_EXPIRY_HOURS * 3600 // PASSWORD_RESET_RESEND_SECONDS
+)
 
 supported_compilers = ["clang++", "g++"]
 

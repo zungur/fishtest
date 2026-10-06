@@ -1,10 +1,11 @@
 import hmac
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from pymongo import ASCENDING
 from vtjson import ValidationError, validate
 
 import fishtest.github_api as gh
+from fishtest.constants import PASSWORD_RESET_MAX_TOKENS, PASSWORD_RESET_RESEND_SECONDS
 from fishtest.lru_cache import lru_cache
 from fishtest.password_hash import (
     PasswordHashBusy,
@@ -13,9 +14,12 @@ from fishtest.password_hash import (
     needs_rehash,
     verify_password,
 )
-from fishtest.schemas import user_schema
+from fishtest.schemas import password_reset_schema, user_schema
 
 DEFAULT_MACHINE_LIMIT = 16
+# Email addresses are compared case-insensitively; the unique index on
+# users.email uses the same collation (see utils/create_indexes.py).
+EMAIL_COLLATION = {"locale": "en", "strength": 2}
 
 
 def validate_user(user):
@@ -47,7 +51,15 @@ class UserDb:
         return self.users.find_one({"username": name})
 
     def find_by_email(self, email):
-        return self.users.find_one({"email": email})
+        return self.users.find_one({"email": email}, collation=EMAIL_COLLATION)
+
+    def find_all_by_email(self, email):
+        """Return every account using ``email``.
+
+        More than one only while duplicates that predate the unique index
+        remain (see utils/find_duplicate_emails.py).
+        """
+        return list(self.users.find({"email": email}, collation=EMAIL_COLLATION))
 
     @staticmethod
     def _fail(*, user_message: str, code: str, log_message: str | None = None):
@@ -142,6 +154,66 @@ class UserDb:
             "authenticated": True,
             "credentials_version": user.get("credentials_version", 0),
         }
+
+    def add_password_reset(self, user_id, token, expires_at):
+        """Add a password reset token (sha256 digest) unless one is recent.
+
+        Returns False, storing nothing, if the account got a token less than
+        ``PASSWORD_RESET_RESEND_SECONDS`` ago. Earlier tokens stay valid until
+        they expire or one of them is used; only the newest
+        ``PASSWORD_RESET_MAX_TOKENS`` are kept.
+        """
+        now = datetime.now(UTC)
+        entry = {"token": token, "expires_at": expires_at, "created": now}
+        validate(password_reset_schema, entry, "password_reset")
+        recent = now - timedelta(seconds=PASSWORD_RESET_RESEND_SECONDS)
+        result = self.users.update_one(
+            {
+                "_id": user_id,
+                "password_reset": {
+                    "$not": {"$elemMatch": {"created": {"$gt": recent}}}
+                },
+            },
+            {
+                "$push": {
+                    "password_reset": {
+                        "$each": [entry],
+                        "$slice": -PASSWORD_RESET_MAX_TOKENS,
+                    }
+                }
+            },
+        )
+        if result.modified_count:
+            self.clear_cache()
+        return result.modified_count > 0
+
+    @staticmethod
+    def _live_reset_token_query(token):
+        return {
+            "password_reset": {
+                "$elemMatch": {
+                    "token": token,
+                    "expires_at": {"$gte": datetime.now(UTC)},
+                }
+            }
+        }
+
+    def find_by_reset_token(self, token):
+        return self.users.find_one(self._live_reset_token_query(token))
+
+    def update_password_with_reset_token(self, user_id, token, hashed_password):
+        """Atomically set a new password, bump credentials_version, and consume all reset tokens."""
+        result = self.users.update_one(
+            {"_id": user_id, **self._live_reset_token_query(token)},
+            {
+                "$set": {"password": hashed_password},
+                "$inc": {"credentials_version": 1},
+                "$unset": {"password_reset": ""},
+            },
+        )
+        if result.modified_count:
+            self.clear_cache()
+        return result
 
     def get_users(self):
         return self.users.find(sort=[("_id", ASCENDING)])
