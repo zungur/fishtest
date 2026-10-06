@@ -462,7 +462,16 @@ class _ViewContext:
 
     @property
     def authenticated_userid(self) -> str | None:
-        return authenticated_user(self.session)
+        username = authenticated_user(self.session)
+        if not username:
+            return None
+        user = self.userdb.get_user(username)
+        session_version = self.session.data.get("credentials_version", 0)
+        if user is None or session_version != user.get("credentials_version", 0):
+            forget(self)
+            self.session.invalidate()
+            return None
+        return username
 
     def has_permission(self, permission: str) -> bool:
         if permission != "approve_run":
@@ -683,6 +692,7 @@ def login(request: _ViewContext) -> dict[str, Any] | RedirectResponse:
             else:
                 # Session ends when the browser is closed
                 remember(request, username)
+            request.session.data["credentials_version"] = token["credentials_version"]
             next_page = request.params.get("next") or came_from
             return RedirectResponse(url=next_page, status_code=302)
         message = token["error"]
@@ -1690,7 +1700,8 @@ def user(request: _ViewContext) -> dict[str, Any] | RedirectResponse:  # noqa: C
         request.session.flash("You cannot inspect users", "error")
         return home(request)
 
-    user_data = request.userdb.get_user(user_name)
+    # A POST saves the whole record, so it must not start from a stale copy.
+    user_data = request.userdb.get_user(user_name, fresh=request.method == "POST")
     if user_data is None:
         raise StarletteHTTPException(status_code=404)
     if "user" in request.POST:
@@ -1700,6 +1711,7 @@ def user(request: _ViewContext) -> dict[str, Any] | RedirectResponse:  # noqa: C
             new_password_verify = _form_string_value(request.POST, "password2").strip()
             new_email = _form_string_value(request.POST, "email").strip()
             tests_repo = _form_string_value(request.POST, "tests_repo").strip()
+            password_changed = False
 
             # Temporary comparison until passwords are hashed.
             if old_password != user_data["password"].strip():
@@ -1716,7 +1728,10 @@ def user(request: _ViewContext) -> dict[str, Any] | RedirectResponse:  # noqa: C
                     )
                     if strong_password:
                         user_data["password"] = new_password
-                        request.session.flash("Success! Password updated")
+                        user_data["credentials_version"] = (
+                            user_data.get("credentials_version", 0) + 1
+                        )
+                        password_changed = True
                     else:
                         request.session.flash(password_err, "error")
                         return home(request)
@@ -1749,6 +1764,14 @@ def user(request: _ViewContext) -> dict[str, Any] | RedirectResponse:  # noqa: C
                 user_data["email"] = validated_email
                 request.session.flash("Success! Email updated")
             request.userdb.save_user(user_data)
+            if password_changed:
+                request.rundb.worker_sessions.delete_for_user(user_name)
+                forget(request)
+                request.session.invalidate()
+                request.session.flash(
+                    "Success! Your password has been updated. Please log in.",
+                )
+                return RedirectResponse(url="/login", status_code=302)
         elif "blocked" in request.POST and request.POST["blocked"].isdigit():
             user_data["blocked"] = bool(int(request.POST["blocked"]))
             request.session.flash(

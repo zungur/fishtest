@@ -13,12 +13,16 @@ from starlette.responses import JSONResponse, RedirectResponse, StreamingRespons
 from vtjson import ValidationError, validate
 
 import fishtest.github_api as gh
+from fishtest.constants import (
+    WORKER_SESSION_MAX_AGE_SECONDS,
+    WORKER_SESSION_RENEW_SECONDS,
+)
 from fishtest.http.boundary import ApiRequestShim, get_request_shim
 from fishtest.schemas import api_access_schema, api_schema, gzip_data
 from fishtest.stats.stat_util import SPRT_elo, get_elo
 from fishtest.util import strip_run, worker_name
 
-WORKER_VERSION = 329
+WORKER_VERSION = 330
 
 WORKER_API_PATHS = {
     "/api/request_version",
@@ -30,6 +34,7 @@ WORKER_API_PATHS = {
     "/api/stop_run",
     "/api/upload_pgn",
     "/api/worker_log",
+    "/api/worker_logout",
 }
 
 # Primary-only worker endpoints exclude upload_pgn, which is routed to a
@@ -86,20 +91,57 @@ class WorkerApi(GenericApi):
         except Exception:
             self.handle_error("request is not json encoded")
 
-    def validate_username_password(self):
+    def validate_auth(self, password_login=False):
+        """Authenticate the worker by its session token or its password.
+
+        Workers older than v330 send the password with every request. With the
+        password and ``new_session`` (``/api/request_version`` only) a worker
+        logs in for a session and sends the session token from then on.
+        Returns the token of a new session, or None.
+        """
         # Is the request syntactically correct?
         try:
             validate(api_access_schema, self.request_body, "request")
         except ValidationError as e:
             self.handle_error(str(e))
 
+        username = self.request_body["worker_info"]["username"]
+        userdb = self.request.userdb
+        worker_sessions = self.request.rundb.worker_sessions
+
+        if "session_token" in self.request_body:
+            session_token = self.request_body["session_token"]
+            user = userdb.get_user(username)
+            # request_version runs before every task: refusing sessions close
+            # to their maximum age there makes the worker log in again before
+            # a task can run into it.
+            max_age = WORKER_SESSION_MAX_AGE_SECONDS
+            if password_login:
+                max_age -= WORKER_SESSION_RENEW_SECONDS
+            if user is None or not worker_sessions.validate(
+                username,
+                session_token,
+                user.get("credentials_version", 0),
+                max_age_seconds=max_age,
+            ):
+                self.handle_error("Invalid or expired session.", status_code=401)
+            status_error = userdb._account_status_error(user, username)
+            if status_error is not None:
+                self.handle_error(status_error["error"], status_code=401)
+            return
+
         # is the supplied password correct?
-        token = self.request.userdb.authenticate(
-            self.request_body["worker_info"]["username"],
-            self.request_body["password"],
-        )
+        token = userdb.authenticate(username, self.request_body.get("password", ""))
         if "error" in token:
             self.handle_error(token["error"], status_code=401)
+        if not password_login or self.request_body.get("new_session") is not True:
+            return
+
+        return worker_sessions.create(
+            username,
+            token["credentials_version"],
+            userdb.get_machine_limit(username),
+        )
 
     def validate_request(self):
         """This function will load the run from the cache or the db,
@@ -112,7 +154,7 @@ class WorkerApi(GenericApi):
         self.__task = None
 
         # Preliminary validation.
-        self.validate_username_password()
+        self.validate_auth()
 
         # Is the request syntactically correct?
         try:
@@ -315,8 +357,18 @@ class WorkerApi(GenericApi):
     def request_version(self):
         # By being more lax here, we can be more strict
         # elsewhere since the worker will upgrade.
-        self.validate_username_password()
-        return self.add_time({"version": WORKER_VERSION})
+        session_token = self.validate_auth(password_login=True)
+        result = {"version": WORKER_VERSION}
+        if session_token is not None:
+            result["session_token"] = session_token
+        return self.add_time(result)
+
+    def worker_logout(self):
+        self.validate_auth()
+        session_token = self.request_body.get("session_token", "")
+        if session_token:
+            self.request.rundb.worker_sessions.delete(session_token)
+        return self.add_time({})
 
     def beat(self):
         self.validate_request()
@@ -664,6 +716,12 @@ async def api_stop_run(request: Request):
 async def api_request_version(request: Request):
     api = WorkerApi(await get_request_shim(request))
     return await run_in_threadpool(api.request_version)
+
+
+@router.post("/api/worker_logout")
+async def api_worker_logout(request: Request):
+    api = WorkerApi(await get_request_shim(request))
+    return await run_in_threadpool(api.worker_logout)
 
 
 @router.post("/api/beat")

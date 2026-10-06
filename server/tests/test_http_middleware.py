@@ -119,6 +119,22 @@ class TestHttpMiddleware(unittest.TestCase):
         self.assertIn("error", body)
         self.assertIn("/api/request_task", body["error"])
 
+    def test_reject_non_primary_worker_logout(self):
+        from fishtest.http.middleware import RejectNonPrimaryWorkerApiMiddleware
+
+        app = self.FastAPI()
+        app.add_middleware(RejectNonPrimaryWorkerApiMiddleware)
+        app.state.rundb = _RunDbStub(is_primary=False)
+
+        @app.post("/api/worker_logout")
+        async def _worker_logout():
+            return {"ok": True}
+
+        client = self.TestClient(app)
+        response = client.post("/api/worker_logout", json={})
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("/api/worker_logout", response.json()["error"])
+
     def test_redirect_blocked_ui_users(self):
         import json
         from base64 import b64encode

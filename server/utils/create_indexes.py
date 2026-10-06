@@ -10,6 +10,7 @@ import sys
 
 from pymongo import ASCENDING, DESCENDING, MongoClient
 
+from fishtest.constants import WORKER_SESSION_IDLE_SECONDS
 from fishtest.rundb import RunDb
 
 db_name = "fishtest_new"
@@ -110,6 +111,19 @@ def create_workers_indexes():
     db["workers"].create_index("worker_name", unique=True)
 
 
+def create_worker_sessions_indexes():
+    db["worker_sessions"].create_index("token_hash", unique=True)
+    db["worker_sessions"].create_index(
+        [("username", ASCENDING), ("last_seen", DESCENDING)],
+        name="worker_sessions_user_last_seen",
+    )
+    db["worker_sessions"].create_index(
+        "last_seen",
+        name="worker_sessions_idle_ttl",
+        expireAfterSeconds=WORKER_SESSION_IDLE_SECONDS,
+    )
+
+
 def create_actions_indexes():
     db["actions"].create_index(
         [("time", DESCENDING), ("_id", DESCENDING)],
@@ -185,6 +199,9 @@ if __name__ == "__main__":
             if collection_name == "workers":
                 drop_indexes("workers")
                 create_workers_indexes()
+            elif collection_name == "worker_sessions":
+                drop_indexes("worker_sessions")
+                create_worker_sessions_indexes()
             elif collection_name == "actions":
                 drop_indexes("actions")
                 create_actions_indexes()

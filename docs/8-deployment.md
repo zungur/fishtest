@@ -29,6 +29,45 @@
 **Session invalidation**: deploying a new `FISHTEST_AUTHENTICATION_SECRET`
 invalidates all existing sessions. Users must re-authenticate once.
 
+### Credential migration (worker sessions)
+
+This release adds worker sessions. A worker logs in one time with its
+password. Then it uses a session token.
+
+Do these steps in `server/`. You can do each step again without risk.
+
+1. Make sure that the v330 worker is on the `master` branch of
+   `official-stockfish/fishtest`. Workers update from this branch.
+2. Create the indexes. You can do this step while the old server runs.
+
+   ```bash
+   cd server
+   python3 utils/create_indexes.py worker_sessions
+   ```
+
+3. Restart the server.
+
+**CAUTION:** A v330 worker does not work with the old server. Deploy the new
+server soon after the v330 worker is on `master`.
+
+#### Worker sessions
+
+- Contributors do not change their configuration. The worker reads the
+  password from `fishtest.cfg`.
+- The server keeps only the sha256 digest of each session token.
+- A worker older than v330 continues to work with its password. It updates
+  itself at its next version check.
+- MongoDB keeps the sessions, thus a server restart does not end them.
+
+A session ends when:
+
+- The worker stops or updates.
+- The session is not used for 24 hours.
+- The session is 30 days old.
+- The user changes the password.
+- The user has more than `max(2 * machine_limit, 32)` sessions. The oldest
+  sessions end first.
+
 ### Primary instance detection
 
 If `FISHTEST_PORT == FISHTEST_PRIMARY_PORT`, the instance is primary. If

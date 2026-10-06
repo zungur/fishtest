@@ -47,6 +47,7 @@ from games import (
     FatalException,
     RunException,
     WorkerException,
+    add_auth,
     backup_log,
     cache_read,
     cache_write,
@@ -74,7 +75,7 @@ MIN_CLANG_MINOR = 0
 
 FASTCHESS_SHA = "60d7a7a26c6b0582a15c112fb29a1829bef2adb3"
 
-WORKER_VERSION = 329
+WORKER_VERSION = 330
 FILE_LIST = ["updater.py", "worker.py", "games.py"]
 HTTP_TIMEOUT = 30.0
 INITIAL_RETRY_TIME = 15.0
@@ -319,28 +320,36 @@ def verify_remote_sri(install_dir):
 
 
 def verify_credentials(remote, username, password, cached):
-    # Returns:
-    # True  : username/password are ok
+    # Logs in for a worker session. Returns:
+    # str   : username/password are ok; the session token (may be empty)
     # False : username/password are not ok
     # None  : network error: unable to determine the status of
     #         username/password
-    req = {}
-    if username != "" and password != "":
-        print(
-            f"Confirming {'cached' if cached else 'supplied'} credentials with {remote}."
-        )
-        payload = {"worker_info": {"username": username}, "password": password}
+    if username == "" or password == "":
+        return False
+    print(f"Confirming {'cached' if cached else 'supplied'} credentials with {remote}.")
+    payload = {
+        "worker_info": {"username": username},
+        "password": password,
+        "new_session": True,
+    }
+    delay = INITIAL_RETRY_TIME
+    while True:
         try:
             req = send_api_post_request(
                 remote + "/api/request_version", payload, quiet=True
             )
         except Exception:
             return None  # network problem (unrecoverable)
-        if "error" in req:
+        if "error" not in req:
+            print("Credentials ok!")
+            return req.get("session_token") or ""
+        if "try again later" not in req["error"]:
             return False  # invalid username/password
-        print("Credentials ok!")
-        return True
-    return False  # empty username or password
+        # The server is busy or throttling password logins.
+        print(f"Retrying in {delay:.0f} seconds.")
+        time.sleep(delay)
+        delay = min(MAX_RETRY_TIME, delay * 2)
 
 
 def get_credentials(config, options, args):
@@ -355,12 +364,12 @@ def get_credentials(config, options, args):
         password = args[1]
         cached = False
     if options.no_validation:
-        return username, password
+        return username, password, ""
 
     ret = verify_credentials(remote, username, password, cached)
     if ret is None:
-        return "", ""
-    elif not ret:
+        return "", "", ""
+    elif ret is False:
         try:
             username = input("\nUsername: ")
             if username != "":
@@ -368,12 +377,13 @@ def get_credentials(config, options, args):
             print("")
         except Exception:
             print("\n")
-            return "", ""
+            return "", "", ""
         else:
-            if not verify_credentials(remote, username, password, False):
-                return "", ""
+            ret = verify_credentials(remote, username, password, False)
+            if ret is None or ret is False:
+                return "", "", ""
 
-    return username, password
+    return username, password, ret
 
 
 def verify_fastchess(fastchess_path, fastchess_sha):
@@ -833,7 +843,7 @@ def setup_parameters(worker_dir):
 
     # Step 6: determine credentials.
 
-    username, password = get_credentials(config, options, args)
+    username, password, session_token = get_credentials(config, options, args)
 
     if username == "":
         print("Invalid or missing credentials.")
@@ -841,6 +851,12 @@ def setup_parameters(worker_dir):
 
     options.username = username
     options.password = password
+    # The session token lives only in memory; it is never written to the config.
+    options.auth = {
+        "username": username,
+        "password": password,
+        "session_token": session_token,
+    }
 
     # Step 7: write command line parameters to the config file.
     config.set("login", "username", options.username)
@@ -1195,10 +1211,9 @@ def get_worker_arch(worker_dir):
     return arch
 
 
-def heartbeat(worker_info, password, remote, current_state):
+def heartbeat(worker_info, auth, remote, current_state):
     print("Start heartbeat.")
     payload = {
-        "password": password,
         "worker_info": worker_info,
     }
     while current_state["alive"]:
@@ -1214,6 +1229,7 @@ def heartbeat(worker_info, password, remote, current_state):
             if payload["run_id"] is None or payload["task_id"] is None:
                 print("Skipping heartbeat...")
                 continue
+            add_auth(payload, auth)
             try:
                 req = send_api_post_request(remote + "/api/beat", payload, quiet=True)
             except Exception as e:
@@ -1244,7 +1260,31 @@ def utcoffset():
     return f"{'+' if utcoffset >= 0 else '-'}{hh:02d}:{mm:02d}"
 
 
-def verify_worker_version(remote, username, password, worker_lock):
+def _request_version(remote, username, credentials):
+    payload = {"worker_info": {"username": username}, **credentials}
+    try:
+        return send_api_post_request(remote + "/api/request_version", payload)
+    except WorkerException:
+        return None
+
+
+def end_session(remote, auth):
+    # Best effort: a session that is not ended explicitly expires on the server.
+    session_token = auth.get("session_token")
+    if not session_token:
+        return
+    auth["session_token"] = ""
+    payload = {
+        "worker_info": {"username": auth.get("username", "")},
+        "session_token": session_token,
+    }
+    try:
+        send_api_post_request(remote + "/api/worker_logout", payload, quiet=True)
+    except WorkerException:
+        pass
+
+
+def verify_worker_version(remote, username, auth, worker_lock):
     # Returns:
     # True: we are the right version and have the correct credentials
     # False: incorrect credentials (the user may have been blocked in the meantime)
@@ -1252,16 +1292,34 @@ def verify_worker_version(remote, username, password, worker_lock):
     # We don't return if the server informs us that a newer version of the worker
     # is available
     print("Verify worker version...")
-    payload = {"worker_info": {"username": username}, "password": password}
-    try:
-        req = send_api_post_request(remote + "/api/request_version", payload)
-    except WorkerException:
-        return None  # the error message has already been written
-    if "error" in req:
-        return False  # likewise
+    req = None
+    if auth.get("session_token"):
+        req = _request_version(
+            remote, username, {"session_token": auth["session_token"]}
+        )
+        if req is None:
+            return None  # the error message has already been written
+        if "error" in req:
+            # The session expired or was revoked: log in again with the password.
+            auth["session_token"] = ""
+    if not auth.get("session_token"):
+        req = _request_version(
+            remote,
+            username,
+            {"password": auth.get("password", ""), "new_session": True},
+        )
+        if req is None:
+            return None  # likewise
+        if "error" in req:
+            if "try again later" in req["error"]:
+                # Password logins are throttled; retry with the usual backoff.
+                return None
+            return False  # likewise
+        auth["session_token"] = req.get("session_token") or ""
     if req["version"] > WORKER_VERSION:
         print(f"Updating worker version to {req['version']}.")
         backup_log()
+        end_session(remote, auth)
         try:
             worker_lock.release()
             update()
@@ -1278,7 +1336,7 @@ def verify_worker_version(remote, username, password, worker_lock):
 def fetch_and_handle_task(
     worker_dir,
     worker_info,
-    password,
+    auth,
     remote,
     current_state,
     global_cache,
@@ -1295,7 +1353,7 @@ def fetch_and_handle_task(
     )
 
     # Check the worker version and upgrade if necessary
-    ret = verify_worker_version(remote, worker_info["username"], password, worker_lock)
+    ret = verify_worker_version(remote, worker_info["username"], auth, worker_lock)
     if ret is False:
         current_state["alive"] = False
     if not ret:
@@ -1319,7 +1377,8 @@ def fetch_and_handle_task(
 
     # Let's go!
     print("Fetching task...")
-    payload = {"worker_info": worker_info, "password": password}
+    payload = {"worker_info": worker_info}
+    add_auth(payload, auth)
     try:
         req = send_api_post_request(remote + "/api/request_task", payload)
     except WorkerException:
@@ -1369,7 +1428,7 @@ def fetch_and_handle_task(
             worker_dir,
             worker_info,
             current_state,
-            password,
+            auth,
             remote,
             run,
             task_id,
@@ -1397,12 +1456,12 @@ def fetch_and_handle_task(
     current_state["run"] = None
 
     payload = {
-        "password": password,
         "run_id": str(run["_id"]),
         "task_id": task_id,
         "message": server_message,
         "worker_info": worker_info,
     }
+    add_auth(payload, auth)
 
     if not success:
         print(f"\nException running games:\n{message}", file=sys.stderr)
@@ -1519,17 +1578,16 @@ def worker():
     # Write sri hashes of the worker files
     write_sri(worker_dir)
 
-    if options.only_config:
-        return 0
-
     remote = f"{options.protocol}://{options.host}:{options.port}"
+
+    if options.only_config:
+        end_session(remote, options.auth)
+        return 0
 
     # Check the worker version and upgrade if necessary
     try:
         if (
-            verify_worker_version(
-                remote, options.username, options.password, worker_lock
-            )
+            verify_worker_version(remote, options.username, options.auth, worker_lock)
             is False
         ):
             return 1
@@ -1546,17 +1604,20 @@ def worker():
 
     # Check for common tool chain issues
     if not verify_toolchain():
+        end_session(remote, options.auth)
         return 1
 
     # Make sure we have a working fastchess
     if not setup_fastchess(
         worker_dir, compiler, options.concurrency, options.global_cache, tests=True
     ):
+        end_session(remote, options.auth)
         return 1
 
     # Check if we are running an unmodified worker
     unmodified = verify_remote_sri(worker_dir)
     if unmodified is None:
+        end_session(remote, options.auth)
         return 1
 
     uname = platform.uname()
@@ -1592,7 +1653,7 @@ def worker():
     # Start heartbeat thread as a daemon (not strictly necessary, but there might be bugs)
     heartbeat_thread = threading.Thread(
         target=heartbeat,
-        args=(worker_info, options.password, remote, current_state),
+        args=(worker_info, options.auth, remote, current_state),
         daemon=True,
     )
     heartbeat_thread.start()
@@ -1612,7 +1673,7 @@ def worker():
         success = fetch_and_handle_task(
             worker_dir,
             worker_info,
-            options.password,
+            options.auth,
             remote,
             current_state,
             options.global_cache,
@@ -1646,6 +1707,9 @@ def worker():
 
     print("Waiting for the heartbeat thread to finish...")
     heartbeat_thread.join(THREAD_JOIN_TIMEOUT)
+
+    print("Ending the worker session.")
+    end_session(remote, options.auth)
 
     return 0 if fish_exit else 1
 

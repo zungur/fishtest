@@ -65,6 +65,7 @@ legacy_username = intersect(
 )
 username = union(valid_username, legacy_username)
 action_username = union(username, "fishtest.system")
+sha256_hex = regex(r"[a-f0-9]{64}", name="sha256_hex")
 net_name = regex(r"nn-[a-f0-9]{12}.nnue", name="net_name")
 tc = regex(r"([1-9]\d*/)?\d+(\.\d+)?(\+\d+(\.\d+)?)?", name="tc")
 str_int = regex(r"[1-9]\d*", name="str_int")
@@ -130,6 +131,18 @@ user_schema = {
     "groups": intersect([str, ...], unique),
     "tests_repo": union(github_repo, ""),
     "machine_limit": uint,
+    # Bumped on password change to invalidate web and worker sessions.
+    "credentials_version?": uint,
+}
+
+worker_session_schema = {
+    "_id?": ObjectId,
+    # sha256 digest of the session token; the raw token is never stored.
+    "token_hash": sha256_hex,
+    "username": username,
+    "credentials_version": uint,
+    "created": datetime_utc,
+    "last_seen": datetime_utc,
 }
 
 kvstore_schema = {
@@ -500,11 +513,23 @@ def valid_spsa_results(stats):
     return stats["wins"] + stats["losses"] + stats["draws"] == stats["num_games"]
 
 
-api_access_schema = lax({"password": str, "worker_info": {"username": username}})
+api_access_schema = intersect(
+    lax(
+        {
+            "password?": str,
+            "session_token?": str,
+            "new_session?": bool,
+            "worker_info": {"username": username},
+        }
+    ),
+    at_least_one_of("password", "session_token"),
+)
 
 api_schema = intersect(
     {
-        "password": str,
+        # Workers older than v330 send the password instead of a session token.
+        "password?": str,
+        "session_token?": str,
         "run_id?": run_id,
         "task_id?": task_id,
         "pgn?": str,

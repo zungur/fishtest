@@ -61,6 +61,7 @@ from fishtest.util import (
     residual_to_color,
     worker_name,
 )
+from fishtest.worker_sessions import WorkerSessionDb
 from fishtest.workerdb import WorkerDb
 
 _UNFINISHED_RUNS_LIGHTWEIGHT_PROJECTION = {
@@ -92,6 +93,7 @@ class RunDb:
         self.userdb = UserDb(self.db)
         self.actiondb = ActionDb(self.db)
         self.workerdb = WorkerDb(self.db)
+        self.worker_sessions = WorkerSessionDb(self.db)
         self.pgndb = self.db["pgns"]
         self.nndb = self.db["nns"]
         self.runs = self.db["runs"]

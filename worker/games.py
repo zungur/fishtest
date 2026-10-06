@@ -321,14 +321,23 @@ def send_api_post_request(api_url, payload, quiet=False):
     return response
 
 
-def post_to_worker_log(
-    worker_info, password, remote, message, run_id=None, task_id=None
-):
+def add_auth(payload, auth):
+    """Attach the worker's session token to an API payload.
+
+    The worker sends the password only to /api/request_version, where it
+    logs in for the token. Long-lived payloads must call this again
+    before every request, since the token changes when the worker logs in again.
+    """
+    payload["session_token"] = auth.get("session_token", "")
+    return payload
+
+
+def post_to_worker_log(worker_info, auth, remote, message, run_id=None, task_id=None):
     payload = {
-        "password": password,
         "worker_info": worker_info,
         "message": message,
     }
+    add_auth(payload, auth)
     if run_id is not None:
         payload["run_id"] = run_id
     if task_id is not None:
@@ -1036,7 +1045,7 @@ def parse_fastchess_output(
     base_name_long,
     current_state,
     worker_info,
-    password,
+    auth,
     remote,
     result,
     spsa_tuning,
@@ -1200,7 +1209,7 @@ def parse_fastchess_output(
                 )
                 post_to_worker_log(
                     worker_info,
-                    password,
+                    auth,
                     remote,
                     message,
                     run_id=run_id,
@@ -1291,6 +1300,7 @@ def parse_fastchess_output(
                 update_succeeded = False
                 for _ in range(5):
                     try:
+                        add_auth(result, auth)
                         response = send_api_post_request(
                             remote + "/api/update_task", result
                         )
@@ -1331,7 +1341,7 @@ def launch_fastchess(
     base_name,
     current_state,
     worker_info,
-    password,
+    auth,
     remote,
     result,
     spsa_tuning,
@@ -1344,6 +1354,7 @@ def launch_fastchess(
 ):
     if spsa_tuning:
         # Request parameters for next game.
+        add_auth(result, auth)
         req = send_api_post_request(remote + "/api/request_spsa", result)
         if "error" in req:
             raise WorkerException(req["error"])
@@ -1419,7 +1430,7 @@ def launch_fastchess(
                     base_name,
                     current_state,
                     worker_info,
-                    password,
+                    auth,
                     remote,
                     result,
                     spsa_tuning,
@@ -1456,7 +1467,7 @@ def run_games(
     worker_dir,
     worker_info,
     current_state,
-    password,
+    auth,
     remote,
     run,
     task_id,
@@ -1503,12 +1514,12 @@ def run_games(
     input_stats["time_losses"] = input_stats.get("time_losses", 0)
 
     result = {
-        "password": password,
         "run_id": str(run["_id"]),
         "task_id": task_id,
         "stats": input_stats,
         "worker_info": worker_info,
     }
+    add_auth(result, auth)
 
     games_remaining = task["num_games"] - input_total_games
 
@@ -1843,7 +1854,7 @@ def run_games(
             base_name,
             current_state,
             worker_info,
-            password,
+            auth,
             remote,
             result,
             spsa_tuning,

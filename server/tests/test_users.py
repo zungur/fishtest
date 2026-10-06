@@ -515,6 +515,63 @@ class TestUsers(UiUserTestCase):
             self.rundb.userdb.user_cache.delete_one({"username": username})
             self.rundb.userdb.clear_cache()
 
+    def test_authenticate_success(self):
+        token = self.rundb.userdb.authenticate(self.username, self.password)
+        self.assertNotIn("error", token)
+        self.assertTrue(token["authenticated"])
+
+    def _create_worker_session(self):
+        user = self.rundb.userdb.get_user(self.username)
+        self.addCleanup(self.rundb.worker_sessions.delete_for_user, self.username)
+        return self.rundb.worker_sessions.create(
+            self.username, user.get("credentials_version", 0), 16
+        )
+
+    def _worker_session_count(self):
+        return self.rundb.worker_sessions.sessions.count_documents(
+            {"username": self.username}
+        )
+
+    def test_password_change_revokes_worker_sessions(self):
+        self._login_user()
+        user = self.rundb.userdb.get_user(self.username)
+        session_token = self._create_worker_session()
+
+        response = self.client.get("/user")
+        csrf = test_support.extract_csrf_token(response.text)
+        new_password = "WorkerSessionRevokingPassword7!"
+        try:
+            response = self.client.post(
+                "/user",
+                data={
+                    "user": self.username,
+                    "old_password": self.password,
+                    "password": new_password,
+                    "password2": new_password,
+                    "email": "",
+                    "tests_repo": user["tests_repo"],
+                    "csrf_token": csrf,
+                },
+                follow_redirects=False,
+            )
+            self.assertEqual(response.status_code, 302)
+            self.assertTrue(response.headers.get("location", "").startswith("/login"))
+            self.assertEqual(self._worker_session_count(), 0)
+            updated = self.rundb.userdb.get_user(self.username)
+            self.assertFalse(
+                self.rundb.worker_sessions.validate(
+                    self.username,
+                    session_token,
+                    updated.get("credentials_version", 0),
+                )
+            )
+        finally:
+            restored = self.rundb.userdb.get_user(self.username)
+            restored["password"] = self.password
+            restored.pop("credentials_version", None)
+            self.rundb.userdb.save_user(restored)
+            self.rundb.userdb.clear_cache()
+
     def test_authenticate_unknown_user(self):
         token = self.rundb.userdb.authenticate("MissingTestUser", "x")
         self.assertEqual(token["error"], "Invalid username or password.")

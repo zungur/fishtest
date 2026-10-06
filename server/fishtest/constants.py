@@ -3,6 +3,20 @@
 PASSWORD_MAX_LENGTH = 72
 VALID_USERNAME_PATTERN = "[A-Za-z0-9]{2,}"
 
+# Worker sessions. A worker exchanges its password for a random session token
+# once per run, so the password KDF does not run on every API call. Sessions
+# end on logout, after this much inactivity, at this age, or on a password
+# change.
+WORKER_SESSION_IDLE_SECONDS = 24 * 3600
+WORKER_SESSION_MAX_AGE_SECONDS = 30 * 24 * 3600
+# /api/request_version, called before every task, refuses sessions this close
+# to their maximum age, so the worker logs in again before a task can hit it.
+WORKER_SESSION_RENEW_SECONDS = 24 * 3600
+# Refresh a session's last_seen at most this often to limit database writes.
+WORKER_SESSION_TOUCH_SECONDS = 600
+# Per-user session cap is max(2 * machine_limit, WORKER_SESSION_MIN_CAP).
+WORKER_SESSION_MIN_CAP = 32
+
 supported_compilers = ["clang++", "g++"]
 
 supported_arches = [

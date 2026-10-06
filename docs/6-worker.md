@@ -263,15 +263,18 @@ Files are sorted by access time; the most recently accessed are preserved.
 
 ## API endpoints used by the worker
 
-All fishtest endpoints use JSON-encoded POST bodies with `password` and
-`worker_info` fields. Responses are JSON dicts that may contain an `error`
-key.
+All fishtest endpoints use JSON-encoded POST bodies with `worker_info` and a
+`session_token` field. The worker logs in with the password from
+`fishtest.cfg` once per run (it sends the password only to
+`/api/request_version`) and keeps the session token in memory only; it logs in
+again if the server rejects the token. Responses are JSON dicts that may
+contain an `error` key.
 
 ### Fishtest server endpoints
 
 | Endpoint | Method | Phase | Purpose |
 |----------|--------|-------|---------|
-| `/api/request_version` | POST | Setup | Check worker version, trigger update |
+| `/api/request_version` | POST | Setup | Log in for a session, check worker version, trigger update |
 | `/api/request_task` | POST | Setup | Request a task assignment |
 | `/api/nn/{id}` | GET | Setup | Download a neural network file |
 | `/api/update_task` | POST | Main loop | Report game results (batch updates) |
@@ -281,6 +284,7 @@ key.
 | `/api/stop_run` | POST | Finish | Request early run termination |
 | `/api/upload_pgn` | POST | Finish | Upload compressed PGN game records |
 | `/api/worker_log` | POST | Any | Log diagnostic message on server |
+| `/api/worker_logout` | POST | Exit | End the worker session |
 
 ### External endpoints
 

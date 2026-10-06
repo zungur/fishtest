@@ -41,42 +41,53 @@ class UserDb:
     def find_by_email(self, email):
         return self.users.find_one({"email": email})
 
-    def authenticate(self, username, password):
-        def fail(*, user_message: str, code: str, log_message: str | None = None):
-            print(log_message or user_message, flush=True)
-            return {"error": user_message, "error_code": code}
+    @staticmethod
+    def _fail(*, user_message: str, code: str, log_message: str | None = None):
+        print(log_message or user_message, flush=True)
+        return {"error": user_message, "error_code": code}
 
+    def _account_status_error(self, user, username):
+        """Return an error dict if the (otherwise authenticated) account is not usable."""
+        if user.get("blocked"):
+            return self._fail(
+                user_message="Your account is blocked.",
+                code="blocked",
+                log_message=f"Login rejected (account blocked): '{username}'",
+            )
+        if user.get("pending"):
+            return self._fail(
+                user_message="Your account is pending approval.",
+                code="pending",
+                log_message=f"Login rejected (pending approval): '{username}'",
+            )
+        return None
+
+    def authenticate(self, username, password):
         user = self.get_user(username)
         if user is None:
             # Avoid username enumeration: user-facing message is identical to wrong-password.
-            return fail(
+            return self._fail(
                 user_message="Invalid username or password.",
                 code="invalid_credentials",
                 log_message=f"Login failed (unknown user): '{username}'",
             )
 
         if user.get("password") != password:
-            return fail(
+            return self._fail(
                 user_message="Invalid username or password.",
                 code="invalid_credentials",
                 log_message=f"Login failed (wrong password): '{username}'",
             )
 
-        if user.get("blocked"):
-            return fail(
-                user_message="Your account is blocked.",
-                code="blocked",
-                log_message=f"Login rejected (account blocked): '{username}'",
-            )
+        status_error = self._account_status_error(user, username)
+        if status_error is not None:
+            return status_error
 
-        if user.get("pending"):
-            return fail(
-                user_message="Your account is pending approval.",
-                code="pending",
-                log_message=f"Login rejected (pending approval): '{username}'",
-            )
-
-        return {"username": username, "authenticated": True}
+        return {
+            "username": username,
+            "authenticated": True,
+            "credentials_version": user.get("credentials_version", 0),
+        }
 
     def get_users(self):
         return self.users.find(sort=[("_id", ASCENDING)])
@@ -101,7 +112,14 @@ class UserDb:
     def get_blocked(self):
         return list(self.users.find({"blocked": True}, sort=[("_id", ASCENDING)]))
 
-    def get_user(self, username):
+    def get_user(self, username, *, fresh=False):
+        """Return the user record; ``fresh`` reads it from MongoDB, not the cache.
+
+        The cached record of another process can be up to 2 minutes old: read
+        it fresh before checking a password or saving a change.
+        """
+        if fresh:
+            return self.users.find_one({"username": username})
         return self.find_by_username(username)
 
     def get_user_groups(self, username):

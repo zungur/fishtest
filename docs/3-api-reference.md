@@ -72,8 +72,11 @@ sequenceDiagram
   end
 ```
 
-1. **Version check** -- `POST /api/request_version`. If the server returns
-   a newer version, the worker self-updates and restarts.
+1. **Version check** -- `POST /api/request_version`. The first call logs in
+   with the password and `"new_session": true`; the reply carries a
+   `session_token` that the worker sends instead of the password from then on.
+   If the server returns a newer version, the worker ends its session,
+   self-updates and restarts.
 2. **Task request** -- `POST /api/request_task`. The server assigns a task
    or returns `{"task_waiting": false}`. The worker retries after a delay.
 3. **Engine build** -- The worker compiles Stockfish from source (cached
@@ -91,13 +94,25 @@ sequenceDiagram
    task. `POST /api/upload_pgn` sends compressed game data. On failure,
    `POST /api/failed_task` reports the error.
 8. **Loop** -- The worker returns to step 2.
+9. **Exit** -- `POST /api/worker_logout` ends the session.
 
 `POST /api/stop_run` and `POST /api/worker_log` are called on demand
 outside the main loop.
 
+## Worker authentication
+
+Every worker request carries `worker_info.username` and either a
+`session_token` or the `password`. On `POST /api/request_version`, a valid
+password with `"new_session": true` creates a session. The server stores the
+sha256 digest of the token, and the session stays valid until the worker logs
+out, it is idle for 24 hours, it is 30 days old (29 days for
+`request_version`), or the user changes the password. A rejected session token
+gets HTTP 401; the worker then logs in again with the password. Workers older
+than v330 send the password with every request; the server still accepts it.
+
 ## Worker API paths
 
-The following 9 endpoints are considered **worker API paths**. On non-primary
+The following 10 endpoints are considered **worker API paths**. On non-primary
 instances, these return HTTP 503 (except `/api/upload_pgn`, which is routed
 to a dedicated backend):
 
@@ -111,26 +126,55 @@ to a dedicated backend):
 /api/stop_run
 /api/upload_pgn
 /api/worker_log
+/api/worker_logout
 ```
 
 ## Authenticated endpoints
 
+The request bodies carry `session_token` (workers older than v330 send
+`password` instead; see [Worker authentication](#worker-authentication)).
+
 ### POST /api/request_version
 
 **Purpose**: Returns the current worker protocol version. Workers call this
-to check if they need to upgrade.
+to check if they need to upgrade, and to log in for a session.
 
 **Request body**:
 ```json
 {
   "password": "string",
+  "new_session": true,
+  "worker_info": { "username": "string" }
+}
+```
+
+Send either `session_token`, or `password` with `"new_session": true` to log
+in. Without `new_session` the password is checked but no session is created.
+
+**Response**:
+```json
+{ "version": 330, "session_token": "string", "duration": 0.001 }
+```
+
+`session_token` is present only when a session was created.
+
+---
+
+### POST /api/worker_logout
+
+**Purpose**: Ends the worker session identified by `session_token`.
+
+**Request body**:
+```json
+{
+  "session_token": "string",
   "worker_info": { "username": "string" }
 }
 ```
 
 **Response**:
 ```json
-{ "version": 322, "duration": 0.001 }
+{ "duration": 0.001 }
 ```
 
 ---
@@ -142,7 +186,7 @@ to check if they need to upgrade.
 **Request body**:
 ```json
 {
-  "password": "string",
+  "session_token": "string",
   "worker_info": {
     "username": "string",
     "unique_key": "string",
@@ -179,7 +223,7 @@ to check if they need to upgrade.
 **Request body**:
 ```json
 {
-  "password": "string",
+  "session_token": "string",
   "worker_info": { "username": "string", "unique_key": "string" },
   "run_id": "string",
   "task_id": 0,
@@ -202,7 +246,7 @@ periodically to prevent the server from reclaiming the task.
 **Request body**:
 ```json
 {
-  "password": "string",
+  "session_token": "string",
   "worker_info": { "username": "string", "unique_key": "string" },
   "run_id": "string",
   "task_id": 0
@@ -223,7 +267,7 @@ periodically to prevent the server from reclaiming the task.
 **Request body**:
 ```json
 {
-  "password": "string",
+  "session_token": "string",
   "worker_info": { "username": "string", "unique_key": "string" },
   "run_id": "string",
   "task_id": 0
@@ -248,7 +292,7 @@ periodically to prevent the server from reclaiming the task.
 **Request body**:
 ```json
 {
-  "password": "string",
+  "session_token": "string",
   "worker_info": { "username": "string", "unique_key": "string" },
   "run_id": "string",
   "task_id": 0,
@@ -271,7 +315,7 @@ Requires the user to have at least 1000 CPU hours.
 **Request body**:
 ```json
 {
-  "password": "string",
+  "session_token": "string",
   "worker_info": { "username": "string", "unique_key": "string" },
   "run_id": "string",
   "task_id": 0,
@@ -293,7 +337,7 @@ Requires the user to have at least 1000 CPU hours.
 **Request body**:
 ```json
 {
-  "password": "string",
+  "session_token": "string",
   "worker_info": { "username": "string", "unique_key": "string" },
   "run_id": "string",
   "task_id": 0,
@@ -321,7 +365,7 @@ verify that the reporting worker is actually assigned to that task.
 **Request body**:
 ```json
 {
-  "password": "string",
+  "session_token": "string",
   "worker_info": { "username": "string", "unique_key": "string" },
   "message": "log message string",
   "run_id": "optional run id when paired with task_id",

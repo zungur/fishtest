@@ -7,7 +7,7 @@ import gzip
 import io
 import sys
 import unittest
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import test_support
 
@@ -15,10 +15,18 @@ from fishtest.run_cache import Prio
 
 try:
     from fishtest.api import WORKER_VERSION
+    from fishtest.constants import (
+        WORKER_SESSION_MAX_AGE_SECONDS,
+        WORKER_SESSION_RENEW_SECONDS,
+    )
     from fishtest.schemas import ACTION_MESSAGE_SIZE
     from fishtest.util import worker_name
+    from fishtest.worker_sessions import hash_session_token
 except ModuleNotFoundError:  # pragma: no cover
+    hash_session_token = None  # type: ignore[assignment]
     WORKER_VERSION = None  # type: ignore[assignment]
+    WORKER_SESSION_MAX_AGE_SECONDS = None  # type: ignore[assignment]
+    WORKER_SESSION_RENEW_SECONDS = None  # type: ignore[assignment]
     ACTION_MESSAGE_SIZE = None  # type: ignore[assignment]
     worker_name = None  # type: ignore[assignment]
 
@@ -97,6 +105,8 @@ class TestHttpApi(unittest.TestCase):
 
     def setUp(self):
         self._reset_runs()
+        self._session_token = None
+        self.rundb.worker_sessions.delete_for_user(self.username)
 
     def _reset_runs(self) -> None:
         self.rundb.runs.delete_many({})
@@ -108,9 +118,26 @@ class TestHttpApi(unittest.TestCase):
         self.rundb.worker_runs.clear()
         self.rundb.connections_counter.clear()
 
-    def _payload(self, *, password: str, worker_info: dict | None = None) -> dict:
-        return {
+    def _payload(
+        self,
+        *,
+        password: str,
+        worker_info: dict | None = None,
+        new_session: bool = True,
+    ) -> dict:
+        payload = {
             "password": password,
+            "worker_info": copy.deepcopy(worker_info or self.worker_info),
+        }
+        if new_session:
+            payload["new_session"] = True
+        return payload
+
+    def _worker_payload(self, *, worker_info: dict | None = None) -> dict:
+        if self._session_token is None:
+            self._session_token = self._login()
+        return {
+            "session_token": self._session_token,
             "worker_info": copy.deepcopy(worker_info or self.worker_info),
         }
 
@@ -276,6 +303,7 @@ class TestHttpApi(unittest.TestCase):
             "/api/stop_run",
             "/api/upload_pgn",
             "/api/worker_log",
+            "/api/worker_logout",
         ]
         for path in endpoints:
             response = self.client.post(
@@ -299,6 +327,7 @@ class TestHttpApi(unittest.TestCase):
             "/api/stop_run",
             "/api/upload_pgn",
             "/api/worker_log",
+            "/api/worker_logout",
         ]
         for path in endpoints:
             response = self.client.post(
@@ -311,6 +340,168 @@ class TestHttpApi(unittest.TestCase):
                 path=path,
             )
 
+    def _session_payload(self, *, session_token: str) -> dict:
+        return {
+            "session_token": session_token,
+            "worker_info": copy.deepcopy(self.worker_info),
+        }
+
+    def _session_count(self) -> int:
+        return self.rundb.worker_sessions.sessions.count_documents(
+            {"username": self.username}
+        )
+
+    def _login(self) -> str:
+        payload = self._payload(password=self.password)
+        response = self.client.post("/api/request_version", json=payload)
+        self.assertEqual(response.status_code, 200)
+        session_token = response.json().get("session_token")
+        self.assertIsInstance(session_token, str)
+        return session_token
+
+    def test_password_login_with_new_session_issues_token(self):
+        session_token = self._login()
+        self.assertGreaterEqual(len(session_token), 40)
+        sessions = list(
+            self.rundb.worker_sessions.sessions.find({"username": self.username})
+        )
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0]["token_hash"], hash_session_token(session_token))
+        self.assertNotIn(session_token, str(sessions[0]))
+
+    def test_password_auth_without_new_session_issues_no_token(self):
+        response = self.client.post(
+            "/api/request_version",
+            json=self._payload(password=self.password, new_session=False),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("session_token", response.json())
+        self.assertEqual(self._session_count(), 0)
+
+    def test_password_is_accepted_without_a_session(self):
+        response = self.client.post(
+            "/api/request_task",
+            json=self._payload(password=self.password, new_session=False),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("error", response.json())
+        self.assertEqual(self._session_count(), 0)
+
+    def test_empty_session_token_is_rejected(self):
+        response = self.client.post(
+            "/api/request_task",
+            json=self._session_payload(session_token=""),
+        )
+        self._assert_worker_error_response(
+            response,
+            status_code=401,
+            path="/api/request_task",
+            contains="Invalid or expired session",
+        )
+
+    def test_request_version_with_session_token(self):
+        session_token = self._login()
+        payload = self._session_payload(session_token=session_token)
+        payload["new_session"] = True
+        response = self.client.post("/api/request_version", json=payload)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["version"], WORKER_VERSION)
+        self.assertNotIn("session_token", body)
+        self.assertEqual(self._session_count(), 1)
+
+    def test_request_version_wrong_session_token(self):
+        self._login()
+        response = self.client.post(
+            "/api/request_version",
+            json=self._session_payload(session_token="not-a-real-session"),
+        )
+        self._assert_worker_error_response(
+            response,
+            status_code=401,
+            path="/api/request_version",
+        )
+
+    def test_request_version_renews_session_near_max_age(self):
+        session_token = self._login()
+        created = datetime.now(UTC) - timedelta(
+            seconds=WORKER_SESSION_MAX_AGE_SECONDS - WORKER_SESSION_RENEW_SECONDS + 60
+        )
+        self.rundb.worker_sessions.sessions.update_one(
+            {"token_hash": hash_session_token(session_token)},
+            {"$set": {"created": created}},
+        )
+        self.rundb.worker_sessions._cache.clear()
+        response = self.client.post(
+            "/api/request_task",
+            json=self._session_payload(session_token=session_token),
+        )
+        self.assertNotIn("Invalid or expired session", response.text)
+        response = self.client.post(
+            "/api/request_version",
+            json=self._session_payload(session_token=session_token),
+        )
+        self._assert_worker_error_response(
+            response,
+            status_code=401,
+            path="/api/request_version",
+            contains="Invalid or expired session",
+        )
+
+    def test_credentials_version_bump_invalidates_session(self):
+        session_token = self._login()
+        user = self.rundb.userdb.get_user(self.username)
+        user["credentials_version"] = user.get("credentials_version", 0) + 1
+        self.rundb.userdb.save_user(user)
+        response = self.client.post(
+            "/api/request_version",
+            json=self._session_payload(session_token=session_token),
+        )
+        self._assert_worker_error_response(
+            response,
+            status_code=401,
+            path="/api/request_version",
+        )
+
+    def test_blocked_user_session_is_rejected(self):
+        session_token = self._login()
+        user = self.rundb.userdb.get_user(self.username)
+        user["blocked"] = True
+        self.rundb.userdb.save_user(user)
+        try:
+            response = self.client.post(
+                "/api/request_version",
+                json=self._session_payload(session_token=session_token),
+            )
+            self._assert_worker_error_response(
+                response,
+                status_code=401,
+                path="/api/request_version",
+            )
+        finally:
+            user = self.rundb.userdb.get_user(self.username)
+            user["blocked"] = False
+            self.rundb.userdb.save_user(user)
+
+    def test_worker_logout_ends_session(self):
+        session_token = self._login()
+        response = self.client.post(
+            "/api/worker_logout",
+            json=self._session_payload(session_token=session_token),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("error", response.json())
+        self.assertEqual(self._session_count(), 0)
+        response = self.client.post(
+            "/api/request_version",
+            json=self._session_payload(session_token=session_token),
+        )
+        self._assert_worker_error_response(
+            response,
+            status_code=401,
+            path="/api/request_version",
+        )
+
     def test_worker_endpoints_missing_worker_info_is_validation_error(self):
         endpoints = [
             "/api/request_version",
@@ -322,6 +513,7 @@ class TestHttpApi(unittest.TestCase):
             "/api/stop_run",
             "/api/upload_pgn",
             "/api/worker_log",
+            "/api/worker_logout",
         ]
         for path in endpoints:
             response = self.client.post(
@@ -345,6 +537,7 @@ class TestHttpApi(unittest.TestCase):
             "/api/stop_run",
             "/api/upload_pgn",
             "/api/worker_log",
+            "/api/worker_logout",
         ]
         for path in endpoints:
             response = self.client.post(
@@ -365,7 +558,7 @@ class TestHttpApi(unittest.TestCase):
 
         response = self.client.post(
             "/api/request_task",
-            json=self._payload(password=self.password, worker_info=worker_info),
+            json=self._worker_payload(worker_info=worker_info),
         )
         self.assertEqual(response.status_code, 400)
         body = response.json()
@@ -378,7 +571,7 @@ class TestHttpApi(unittest.TestCase):
         self._reset_runs()
         response = self.client.post(
             "/api/request_task",
-            json=self._payload(password=self.password),
+            json=self._worker_payload(),
         )
         self.assertEqual(response.status_code, 200)
         body = response.json()
@@ -392,7 +585,7 @@ class TestHttpApi(unittest.TestCase):
 
         response = self.client.post(
             "/api/request_task",
-            json=self._payload(password=self.password),
+            json=self._worker_payload(),
         )
         self.assertEqual(response.status_code, 200)
         body = response.json()
@@ -420,7 +613,7 @@ class TestHttpApi(unittest.TestCase):
         try:
             response = self.client.post(
                 "/api/request_task",
-                json=self._payload(password=self.password),
+                json=self._worker_payload(),
             )
         finally:
             self.rundb.workerdb.update_worker(
@@ -447,7 +640,7 @@ class TestHttpApi(unittest.TestCase):
         pgn_payload = self._build_pgn_payload("missing-run", 0)
         for path in endpoints:
             payload = {
-                **self._payload(password=self.password),
+                **self._worker_payload(),
                 "task_id": 0,
             }
             if path == "/api/upload_pgn":
@@ -473,7 +666,7 @@ class TestHttpApi(unittest.TestCase):
         pgn_payload = self._build_pgn_payload(run_id, task_id)
         for path in endpoints:
             payload = {
-                **self._payload(password=self.password),
+                **self._worker_payload(),
                 "run_id": run_id,
             }
             if path == "/api/upload_pgn":
@@ -498,7 +691,7 @@ class TestHttpApi(unittest.TestCase):
         pgn_payload = self._build_pgn_payload("0123456789abcdef01234567", 0)
         for path in endpoints:
             payload = {
-                **self._payload(password=self.password),
+                **self._worker_payload(),
                 "run_id": "0123456789abcdef01234567",
                 "task_id": 0,
             }
@@ -525,7 +718,7 @@ class TestHttpApi(unittest.TestCase):
         pgn_payload = self._build_pgn_payload(run_id, 0)
         for path in endpoints:
             payload = {
-                **self._payload(password=self.password),
+                **self._worker_payload(),
                 "run_id": run_id,
                 "task_id": 99,
             }
@@ -554,7 +747,7 @@ class TestHttpApi(unittest.TestCase):
         worker_info["unique_key"] = "f4f1a1b6-2dd0-4f2b-ae6e-3f6f3b3b4c7b"
         for path in endpoints:
             payload = {
-                **self._payload(password=self.password, worker_info=worker_info),
+                **self._worker_payload(worker_info=worker_info),
                 "run_id": run_id,
                 "task_id": task_id,
             }
@@ -573,7 +766,7 @@ class TestHttpApi(unittest.TestCase):
         response = self.client.post(
             "/api/worker_log",
             json={
-                **self._payload(password=self.password),
+                **self._worker_payload(),
                 "run_id": run_id,
                 "task_id": task_id,
                 "message": "hello",
@@ -603,7 +796,7 @@ class TestHttpApi(unittest.TestCase):
         response = self.client.post(
             "/api/worker_log",
             json={
-                **self._payload(password=self.password),
+                **self._worker_payload(),
                 "run_id": run_id,
                 "message": "hello",
             },
@@ -622,7 +815,7 @@ class TestHttpApi(unittest.TestCase):
         response = self.client.post(
             "/api/worker_log",
             json={
-                **self._payload(password=self.password),
+                **self._worker_payload(),
                 "run_id": run_id,
                 "task_id": task_id,
                 "message": long_message,
@@ -668,7 +861,7 @@ class TestHttpApi(unittest.TestCase):
         response = self.client.post(
             "/api/update_task",
             json={
-                **self._payload(password=self.password),
+                **self._worker_payload(),
                 "run_id": run_id,
                 "task_id": task_id,
                 "stats": {
@@ -691,7 +884,7 @@ class TestHttpApi(unittest.TestCase):
         response = self.client.post(
             "/api/beat",
             json={
-                **self._payload(password=self.password),
+                **self._worker_payload(),
                 "run_id": run_id,
                 "task_id": task_id,
             },
@@ -706,7 +899,7 @@ class TestHttpApi(unittest.TestCase):
         response = self.client.post(
             "/api/request_spsa",
             json={
-                **self._payload(password=self.password),
+                **self._worker_payload(),
                 "run_id": run_id,
                 "task_id": task_id,
             },
@@ -721,7 +914,7 @@ class TestHttpApi(unittest.TestCase):
         response = self.client.post(
             "/api/failed_task",
             json={
-                **self._payload(password=self.password),
+                **self._worker_payload(),
                 "run_id": run_id,
                 "task_id": task_id,
                 "message": "failed for test",
@@ -741,7 +934,7 @@ class TestHttpApi(unittest.TestCase):
             response = self.client.post(
                 "/api/stop_run",
                 json={
-                    **self._payload(password=self.password),
+                    **self._worker_payload(),
                     "run_id": run_id,
                     "task_id": task_id,
                     "message": "stop run for test",
@@ -762,7 +955,7 @@ class TestHttpApi(unittest.TestCase):
         response = self.client.post(
             "/api/stop_run",
             json={
-                **self._payload(password=self.password),
+                **self._worker_payload(),
                 "run_id": run_id,
                 "task_id": task_id,
                 "message": "stop run for test",
@@ -788,7 +981,7 @@ class TestHttpApi(unittest.TestCase):
             response = self.client.post(
                 "/api/stop_run",
                 json={
-                    **self._payload(password=self.password),
+                    **self._worker_payload(),
                     "run_id": run_id,
                     "task_id": task_id,
                     "message": "stop run for test",
@@ -814,7 +1007,7 @@ class TestHttpApi(unittest.TestCase):
         response = self.client.post(
             "/api/upload_pgn",
             json={
-                **self._payload(password=self.password),
+                **self._worker_payload(),
                 "run_id": run_id,
                 "task_id": task_id,
                 "pgn": pgn_payload,
@@ -829,7 +1022,7 @@ class TestHttpApi(unittest.TestCase):
         response = self.client.post(
             "/api/upload_pgn",
             json={
-                **self._payload(password=self.password),
+                **self._worker_payload(),
                 "run_id": run_id,
                 "task_id": task_id,
             },
@@ -846,7 +1039,7 @@ class TestHttpApi(unittest.TestCase):
         response = self.client.post(
             "/api/upload_pgn",
             json={
-                **self._payload(password=self.password),
+                **self._worker_payload(),
                 "run_id": run_id,
                 "task_id": task_id,
                 "pgn": "not-base64",
@@ -864,7 +1057,7 @@ class TestHttpApi(unittest.TestCase):
         response = self.client.post(
             "/api/upload_pgn",
             json={
-                **self._payload(password=self.password),
+                **self._worker_payload(),
                 "run_id": run_id,
                 "task_id": task_id,
                 "pgn": invalid_payload,
@@ -937,14 +1130,14 @@ class TestHttpApi(unittest.TestCase):
 
         response = self.client.post(
             "/api/request_task",
-            json=self._payload(password=self.password),
+            json=self._worker_payload(),
         )
         self.assertEqual(response.status_code, 200)
         self.assertNotIn("error", response.json())
 
         response = self.client.post(
             "/api/request_task",
-            json=self._payload(password=self.password),
+            json=self._worker_payload(),
         )
         self.assertEqual(response.status_code, 200)
         self.assertNotIn("error", response.json())
@@ -955,7 +1148,7 @@ class TestHttpApi(unittest.TestCase):
 
         response = self.client.post(
             "/api/request_task",
-            json=self._payload(password=self.password),
+            json=self._worker_payload(),
         )
         body = response.json()
         self.assertEqual(body["run"]["_id"], run_id)
@@ -971,7 +1164,7 @@ class TestHttpApi(unittest.TestCase):
         response = self.client.post(
             "/api/update_task",
             json={
-                **self._payload(password=self.password),
+                **self._worker_payload(),
                 "run_id": run_id,
                 "task_id": 0,
                 "stats": {
@@ -990,7 +1183,7 @@ class TestHttpApi(unittest.TestCase):
 
         response = self.client.post(
             "/api/request_task",
-            json=self._payload(password=self.password),
+            json=self._worker_payload(),
         )
         body = response.json()
         self.assertEqual(body["run"]["_id"], run_id)
@@ -1009,7 +1202,7 @@ class TestHttpApi(unittest.TestCase):
         response = self.client.post(
             "/api/update_task",
             json={
-                **self._payload(password=self.password),
+                **self._worker_payload(),
                 "run_id": run_id,
                 "task_id": 1,
                 "stats": {
