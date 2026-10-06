@@ -18,6 +18,24 @@ from fishtest.util import PASSWORD_MAX_LENGTH
 class TestUsers(UiUserTestCase):
     username = "TestAuthUser"
 
+    def test_web_login_busy_kdf_answers_503(self):
+        from fishtest.password_hash import PasswordHashBusy
+
+        with patch("fishtest.userdb.verify_password", side_effect=PasswordHashBusy):
+            response = self.client.get("/login")
+            csrf = test_support.extract_csrf_token(response.text)
+            response = self.client.post(
+                "/login",
+                data={
+                    "username": self.username,
+                    "password": self.password,
+                    "csrf_token": csrf,
+                },
+                follow_redirects=False,
+            )
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("Server busy", response.text)
+
     def _assert_no_store_headers(self, response):
         self.assertEqual(response.headers.get("Cache-Control"), "no-store")
         self.assertEqual(response.headers.get("Expires"), "0")
@@ -515,10 +533,97 @@ class TestUsers(UiUserTestCase):
             self.rundb.userdb.user_cache.delete_one({"username": username})
             self.rundb.userdb.clear_cache()
 
+    def test_created_user_password_is_scrypt_hashed(self):
+        from fishtest.password_hash import is_hashed, verify_password
+
+        user = self.rundb.userdb.get_user(self.username)
+        self.assertTrue(is_hashed(user["password"]))
+        self.assertNotEqual(user["password"], self.password)
+        self.assertTrue(verify_password(user["password"], self.password))
+
     def test_authenticate_success(self):
         token = self.rundb.userdb.authenticate(self.username, self.password)
         self.assertNotIn("error", token)
         self.assertTrue(token["authenticated"])
+
+    def test_authenticate_lazy_upgrades_legacy_plaintext(self):
+        from fishtest.password_hash import is_hashed
+
+        username = "TestLegacyPlaintextUser"
+        legacy_password = "legacy-plaintext-pw"
+        self.rundb.userdb.users.delete_many({"username": username})
+        self.rundb.userdb.clear_cache()
+        self.addCleanup(self.rundb.userdb.users.delete_many, {"username": username})
+        self.addCleanup(self.rundb.userdb.clear_cache)
+
+        self.rundb.userdb.create_user(
+            username,
+            "initial-password",
+            "legacy-plaintext@example.com",
+            "",
+        )
+        # Simulate a pre-migration record with a plaintext password.
+        user = self.rundb.userdb.get_user(username)
+        user["password"] = legacy_password
+        user["pending"] = False
+        self.rundb.userdb.save_user(user)
+
+        token = self.rundb.userdb.authenticate(username, legacy_password)
+        self.assertTrue(token["authenticated"])
+
+        upgraded = self.rundb.userdb.get_user(username)
+        self.assertTrue(is_hashed(upgraded["password"]))
+        # The upgraded hash still verifies the same password.
+        token = self.rundb.userdb.authenticate(username, legacy_password)
+        self.assertTrue(token["authenticated"])
+
+    def _create_legacy_plaintext_user(self, username, password):
+        self.rundb.userdb.users.delete_many({"username": username})
+        self.addCleanup(self.rundb.userdb.users.delete_many, {"username": username})
+        self.addCleanup(self.rundb.userdb.clear_cache)
+        self.rundb.userdb.create_user(
+            username, "initial-password", f"{username.lower()}@example.com", ""
+        )
+        self.rundb.userdb.users.update_one(
+            {"username": username},
+            {"$set": {"password": password, "pending": False}},
+        )
+        self.rundb.userdb.clear_cache()
+
+    def test_legacy_plaintext_non_ascii_password(self):
+        username = "TestLegacyUnicodeUser"
+        self._create_legacy_plaintext_user(username, "pässwörd-légacy")
+        token = self.rundb.userdb.authenticate(username, "wrong-pässwörd")
+        self.assertEqual(token.get("error_code"), "invalid_credentials")
+        token = self.rundb.userdb.authenticate(username, "pässwörd-légacy")
+        self.assertTrue(token["authenticated"])
+
+    def test_lazy_rehash_writes_only_the_password(self):
+        from fishtest.password_hash import is_hashed
+
+        username = "TestLegacyRehashUser"
+        self._create_legacy_plaintext_user(username, "legacy-rehash-pw")
+        stale = self.rundb.userdb.get_user(username)
+        self.rundb.userdb.users.update_one(
+            {"username": username}, {"$set": {"tests_repo": "concurrent-edit"}}
+        )
+        self.assertTrue(
+            self.rundb.userdb._password_matches(dict(stale), "legacy-rehash-pw")
+        )
+        stored = self.rundb.userdb.users.find_one({"username": username})
+        self.assertEqual(stored["tests_repo"], "concurrent-edit")
+        self.assertTrue(is_hashed(stored["password"]))
+
+    def test_lazy_rehash_does_not_undo_a_concurrent_password_change(self):
+        username = "TestLegacyRaceUser"
+        self._create_legacy_plaintext_user(username, "legacy-race-pw")
+        stale = self.rundb.userdb.get_user(username)
+        self.rundb.userdb.users.update_one(
+            {"username": username}, {"$set": {"password": "changed-meanwhile"}}
+        )
+        self.rundb.userdb._password_matches(dict(stale), "legacy-race-pw")
+        stored = self.rundb.userdb.users.find_one({"username": username})
+        self.assertEqual(stored["password"], "changed-meanwhile")
 
     def _create_worker_session(self):
         user = self.rundb.userdb.get_user(self.username)
@@ -532,7 +637,24 @@ class TestUsers(UiUserTestCase):
             {"username": self.username}
         )
 
+    def test_login_strips_password_whitespace(self):
+        response = self.client.get("/login")
+        csrf = test_support.extract_csrf_token(response.text)
+
+        response = self.client.post(
+            "/login",
+            data={
+                "username": self.username,
+                "password": f"  {self.password}  ",
+                "csrf_token": csrf,
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(response.status_code, 302)
+
     def test_password_change_revokes_worker_sessions(self):
+        from fishtest.password_hash import hash_password
+
         self._login_user()
         user = self.rundb.userdb.get_user(self.username)
         session_token = self._create_worker_session()
@@ -567,10 +689,28 @@ class TestUsers(UiUserTestCase):
             )
         finally:
             restored = self.rundb.userdb.get_user(self.username)
-            restored["password"] = self.password
+            restored["password"] = hash_password(self.password)
             restored.pop("credentials_version", None)
             self.rundb.userdb.save_user(restored)
             self.rundb.userdb.clear_cache()
+
+    def test_create_user_lets_a_busy_kdf_through(self):
+        from fishtest.password_hash import PasswordHashBusy
+
+        self.addCleanup(
+            self.rundb.userdb.users.delete_one, {"username": "TestBusySignup"}
+        )
+        with (
+            patch("fishtest.userdb.hash_password", side_effect=PasswordHashBusy),
+            self.assertRaises(PasswordHashBusy),
+        ):
+            self.rundb.userdb.create_user(
+                "TestBusySignup",
+                "BusySignupPassword1!",
+                "busy-signup-test@user.net",
+                "https://github.com/official-stockfish/Stockfish",
+            )
+        self.assertIsNone(self.rundb.userdb.get_user("TestBusySignup", fresh=True))
 
     def test_authenticate_unknown_user(self):
         token = self.rundb.userdb.authenticate("MissingTestUser", "x")

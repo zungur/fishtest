@@ -29,10 +29,14 @@
 **Session invalidation**: deploying a new `FISHTEST_AUTHENTICATION_SECRET`
 invalidates all existing sessions. Users must re-authenticate once.
 
-### Credential migration (worker sessions)
+### Credential migration (password hashing and worker sessions)
 
-This release adds worker sessions. A worker logs in one time with its
-password. Then it uses a session token.
+This release keeps passwords as scrypt hashes. A worker logs in one time with
+its password. Then it uses a session token.
+
+**WARNING:** Do not run `hash_passwords.py` while the old server runs. The old
+server cannot read hashed passwords: all logins fail and all workers stop. After
+this step, you cannot go back to the old server.
 
 Do these steps in `server/`. You can do each step again without risk.
 
@@ -45,19 +49,36 @@ Do these steps in `server/`. You can do each step again without risk.
    python3 utils/create_indexes.py worker_sessions
    ```
 
-3. Restart the server.
+3. Stop the old server.
+4. Hash the passwords.
+
+   ```bash
+   .venv/bin/python utils/hash_passwords.py
+   ```
+
+5. Start the new server.
 
 **CAUTION:** A v330 worker does not work with the old server. Deploy the new
 server soon after the v330 worker is on `master`.
+
+**NOTE:** To make the downtime shorter, you can do step 4 after step 5. Until
+then, each login hashes the password of its account.
+
+**CAUTION:** Backups from before the migration contain plaintext passwords.
+Keep them secret or delete them.
 
 #### Worker sessions
 
 - Contributors do not change their configuration. The worker reads the
   password from `fishtest.cfg`.
 - The server keeps only the sha256 digest of each session token.
-- A worker older than v330 continues to work with its password. It updates
-  itself at its next version check.
-- MongoDB keeps the sessions, thus a server restart does not end them.
+- At the cutover, each v330 worker logs in one time. MongoDB keeps the
+  sessions, thus later restarts do not cause logins. Sessions from the worker
+  sessions release stay valid.
+- A worker older than v330 fails its current task one time. Then it updates
+  itself. A worker that cannot update stops until a person updates it.
+- When the server is busy, it sends "try again later" (HTTP 503). The worker
+  tries again after a delay of up to 15 minutes.
 
 A session ends when:
 

@@ -21,6 +21,7 @@ from starlette.routing import Route
 from fishtest.api import WORKER_API_PATHS
 from fishtest.api import router as api_router
 from fishtest.http.ui_errors import render_forbidden_response, render_notfound_response
+from fishtest.password_hash import PasswordHashBusy
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
 STATUS_NOT_FOUND: Final[int] = 404
 STATUS_UNAUTHORIZED: Final[int] = 401
 STATUS_FORBIDDEN: Final[int] = 403
+STATUS_SERVICE_UNAVAILABLE: Final[int] = 503
 
 
 def _derive_worker_api_paths() -> set[str]:
@@ -135,8 +137,34 @@ async def _unhandled_exception_handler(
     return PlainTextResponse("Internal Server Error", status_code=500)
 
 
+async def _password_hash_busy_handler(
+    request: Request,
+    exc: Exception,
+) -> Response:
+    _ = exc
+    # Workers retry errors that say "try again later" with their backoff.
+    if request.url.path in _WORKER_API_PATHS:
+        return JSONResponse(
+            {
+                "error": f"{request.url.path}: Server busy, try again later.",
+                "duration": _duration_from_request(request),
+            },
+            status_code=STATUS_SERVICE_UNAVAILABLE,
+        )
+    if request.url.path.startswith("/api"):
+        return JSONResponse(
+            {"detail": "Server busy, try again later."},
+            status_code=STATUS_SERVICE_UNAVAILABLE,
+        )
+    return PlainTextResponse(
+        "Server busy, please try again in a minute.",
+        status_code=STATUS_SERVICE_UNAVAILABLE,
+    )
+
+
 def install_error_handlers(app: FastAPI) -> None:
     """Register exception handlers to preserve legacy API/UI error behavior."""
     app.add_exception_handler(StarletteHTTPException, _http_exception_handler)
     app.add_exception_handler(RequestValidationError, _request_validation_handler)
+    app.add_exception_handler(PasswordHashBusy, _password_hash_busy_handler)
     app.add_exception_handler(Exception, _unhandled_exception_handler)

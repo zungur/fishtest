@@ -66,6 +66,11 @@ legacy_username = intersect(
 username = union(valid_username, legacy_username)
 action_username = union(username, "fishtest.system")
 sha256_hex = regex(r"[a-f0-9]{64}", name="sha256_hex")
+# Either a legacy plaintext password or a self-describing scrypt hash.
+scrypt_hash = regex(
+    r"\$scrypt\$n=\d+,r=\d+,p=\d+\$[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+",
+    name="scrypt_hash",
+)
 net_name = regex(r"nn-[a-f0-9]{12}.nnue", name="net_name")
 tc = regex(r"([1-9]\d*/)?\d+(\.\d+)?(\+\d+(\.\d+)?)?", name="tc")
 str_int = regex(r"[1-9]\d*", name="str_int")
@@ -123,7 +128,9 @@ pgns_schema = intersect(
 user_schema = {
     "_id?": ObjectId,
     "username": username,
-    "password": intersect(str, size(0, PASSWORD_MAX_LENGTH)),
+    # Either a legacy plaintext password (upgraded lazily on next login) or a
+    # scrypt hash produced by fishtest.password_hash.
+    "password": union(intersect(str, size(0, PASSWORD_MAX_LENGTH)), scrypt_hash),
     "registration_time": datetime_utc,
     "pending": bool,
     "blocked": bool,
@@ -527,9 +534,7 @@ api_access_schema = intersect(
 
 api_schema = intersect(
     {
-        # Workers older than v330 send the password instead of a session token.
-        "password?": str,
-        "session_token?": str,
+        "session_token": str,
         "run_id?": run_id,
         "task_id?": task_id,
         "pgn?": str,

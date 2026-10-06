@@ -92,12 +92,15 @@ class WorkerApi(GenericApi):
             self.handle_error("request is not json encoded")
 
     def validate_auth(self, password_login=False):
-        """Authenticate the worker by its session token or its password.
+        """Authenticate the worker by its session token.
 
-        Workers older than v330 send the password with every request. With the
-        password and ``new_session`` (``/api/request_version`` only) a worker
-        logs in for a session and sends the session token from then on.
-        Returns the token of a new session, or None.
+        Only ``password_login`` requests (``/api/request_version``) may omit
+        it: with the password and ``new_session`` a worker logs in for a
+        session, and without ``new_session`` the request is a version query
+        that is answered without checking the password. Workers too old to use
+        sessions send such queries and quit on any error, including "busy",
+        so they must always get the version and update themselves; the reply
+        grants nothing. Returns the token of a new session, or None.
         """
         # Is the request syntactically correct?
         try:
@@ -108,10 +111,18 @@ class WorkerApi(GenericApi):
         username = self.request_body["worker_info"]["username"]
         userdb = self.request.userdb
         worker_sessions = self.request.rundb.worker_sessions
+        user = userdb.get_user(username)
 
-        if "session_token" in self.request_body:
-            session_token = self.request_body["session_token"]
-            user = userdb.get_user(username)
+        session_token = self.request_body.get("session_token", "")
+        if not session_token and not password_login:
+            if "password" in self.request_body:
+                self.handle_error(
+                    "Password authentication is only accepted by "
+                    "/api/request_version, please update your worker.",
+                    status_code=401,
+                )
+            self.handle_error("Invalid or expired session.", status_code=401)
+        if session_token:
             # request_version runs before every task: refusing sessions close
             # to their maximum age there makes the worker log in again before
             # a task can run into it.
@@ -129,17 +140,28 @@ class WorkerApi(GenericApi):
             if status_error is not None:
                 self.handle_error(status_error["error"], status_code=401)
             return
-
-        # is the supplied password correct?
-        token = userdb.authenticate(username, self.request_body.get("password", ""))
-        if "error" in token:
-            self.handle_error(token["error"], status_code=401)
-        if not password_login or self.request_body.get("new_session") is not True:
+        if self.request_body.get("new_session") is not True:
             return
+
+        # Another process may have changed the password or the account status
+        # within the lifetime of the cached record.
+        user = userdb.get_user(username, fresh=True)
+        password = self.request_body.get("password", "")
+        password_ok = (
+            bool(password)
+            and user is not None
+            and bool(user.get("password"))
+            and userdb.password_is_correct(username, password)
+        )
+        if not password_ok:
+            self.handle_error("Invalid username or password.", status_code=401)
+        status_error = userdb._account_status_error(user, username)
+        if status_error is not None:
+            self.handle_error(status_error["error"], status_code=401)
 
         return worker_sessions.create(
             username,
-            token["credentials_version"],
+            user.get("credentials_version", 0),
             userdb.get_machine_limit(username),
         )
 

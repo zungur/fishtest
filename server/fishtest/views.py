@@ -107,6 +107,7 @@ from fishtest.http.ui_cookies import (
     read_cookie_toggle_state,
 )
 from fishtest.http.ui_pipeline import apply_http_cache
+from fishtest.password_hash import hash_password
 from fishtest.run_cache import Prio
 from fishtest.schemas import (
     RUN_VERSION,
@@ -683,8 +684,8 @@ def login(request: _ViewContext) -> dict[str, Any] | RedirectResponse:
             remember_me_checked=remember_me_checked,
         )
 
-        username = _form_string_value(request.POST, "username")
-        password = _form_string_value(request.POST, "password")
+        username = _form_string_value(request.POST, "username").strip()
+        password = _form_string_value(request.POST, "password").strip()
         token = request.userdb.authenticate(username, password)
         if "error" not in token:
             if remember_me_checked:
@@ -1713,8 +1714,7 @@ def user(request: _ViewContext) -> dict[str, Any] | RedirectResponse:  # noqa: C
             tests_repo = _form_string_value(request.POST, "tests_repo").strip()
             password_changed = False
 
-            # Temporary comparison until passwords are hashed.
-            if old_password != user_data["password"].strip():
+            if not request.userdb.password_is_correct(user_name, old_password):
                 request.session.flash("Invalid password!", "error")
                 return home(request)
 
@@ -1727,7 +1727,7 @@ def user(request: _ViewContext) -> dict[str, Any] | RedirectResponse:  # noqa: C
                         (new_email if len(new_email) > 0 else None),
                     )
                     if strong_password:
-                        user_data["password"] = new_password
+                        user_data["password"] = hash_password(new_password)
                         user_data["credentials_version"] = (
                             user_data.get("credentials_version", 0) + 1
                         )

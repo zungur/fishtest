@@ -265,10 +265,10 @@ Files are sorted by access time; the most recently accessed are preserved.
 
 All fishtest endpoints use JSON-encoded POST bodies with `worker_info` and a
 `session_token` field. The worker logs in with the password from
-`fishtest.cfg` once per run (it sends the password only to
-`/api/request_version`) and keeps the session token in memory only; it logs in
-again if the server rejects the token. Responses are JSON dicts that may
-contain an `error` key.
+`fishtest.cfg` once per run (`/api/request_version` is the only endpoint that
+accepts the password) and keeps the session token in memory only; it logs in
+again if the server rejects the token. Responses are
+JSON dicts that may contain an `error` key.
 
 ### Fishtest server endpoints
 

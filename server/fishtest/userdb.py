@@ -1,3 +1,4 @@
+import hmac
 from datetime import UTC, datetime
 
 from pymongo import ASCENDING
@@ -5,6 +6,13 @@ from vtjson import ValidationError, validate
 
 import fishtest.github_api as gh
 from fishtest.lru_cache import lru_cache
+from fishtest.password_hash import (
+    PasswordHashBusy,
+    hash_password,
+    is_hashed,
+    needs_rehash,
+    verify_password,
+)
 from fishtest.schemas import user_schema
 
 DEFAULT_MACHINE_LIMIT = 16
@@ -62,8 +70,54 @@ class UserDb:
             )
         return None
 
+    def _password_matches(self, user, password):
+        """Verify a plaintext password against the stored value.
+
+        Lazily upgrades legacy plaintext and outdated scrypt hashes on success.
+        """
+        stored = user.get("password")
+        if not isinstance(stored, str):
+            return False
+        if is_hashed(stored):
+            matched = verify_password(stored, password)
+        else:
+            # Legacy plaintext password (pre-hashing migration). compare_digest
+            # only accepts ASCII str, so compare the UTF-8 bytes.
+            matched = hmac.compare_digest(
+                stored.encode("utf-8"), password.encode("utf-8")
+            )
+        if not matched:
+            return False
+        if needs_rehash(stored):
+            try:
+                new_hash = hash_password(password)
+                # Only the password field, and only if nobody changed it since
+                # it was read, so a concurrent update is never overwritten.
+                result = self.users.update_one(
+                    {"_id": user["_id"], "password": stored},
+                    {"$set": {"password": new_hash}},
+                )
+                if result.modified_count:
+                    user["password"] = new_hash
+                self.clear_cache()
+            except Exception as e:
+                print(f"Failed to upgrade password hash: {e}", flush=True)
+        return True
+
+    def password_is_correct(self, username, password):
+        """Return True if ``password`` is valid for ``username``.
+
+        Performs the expensive scrypt verification (and lazy rehash) against
+        the record in MongoDB. Account status (blocked/pending) is not
+        considered here; callers check it separately.
+        """
+        user = self.get_user(username, fresh=True)
+        if user is None:
+            return False
+        return self._password_matches(user, password)
+
     def authenticate(self, username, password):
-        user = self.get_user(username)
+        user = self.get_user(username, fresh=True)
         if user is None:
             # Avoid username enumeration: user-facing message is identical to wrong-password.
             return self._fail(
@@ -72,7 +126,7 @@ class UserDb:
                 log_message=f"Login failed (unknown user): '{username}'",
             )
 
-        if user.get("password") != password:
+        if not self._password_matches(user, password):
             return self._fail(
                 user_message="Invalid username or password.",
                 code="invalid_credentials",
@@ -142,7 +196,7 @@ class UserDb:
             # insert the new user in the db
             user = {
                 "username": username,
-                "password": password,
+                "password": hash_password(password),
                 "registration_time": datetime.now(UTC),
                 "pending": True,
                 "blocked": False,
@@ -156,6 +210,8 @@ class UserDb:
             self.clear_cache()
 
             return True
+        except PasswordHashBusy:
+            raise
         except Exception:
             return None
 

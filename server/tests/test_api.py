@@ -8,6 +8,7 @@ import io
 import sys
 import unittest
 from datetime import UTC, datetime, timedelta
+from unittest.mock import patch
 
 import test_support
 
@@ -19,6 +20,7 @@ try:
         WORKER_SESSION_MAX_AGE_SECONDS,
         WORKER_SESSION_RENEW_SECONDS,
     )
+    from fishtest.password_hash import hash_password
     from fishtest.schemas import ACTION_MESSAGE_SIZE
     from fishtest.util import worker_name
     from fishtest.worker_sessions import hash_session_token
@@ -27,6 +29,7 @@ except ModuleNotFoundError:  # pragma: no cover
     WORKER_VERSION = None  # type: ignore[assignment]
     WORKER_SESSION_MAX_AGE_SECONDS = None  # type: ignore[assignment]
     WORKER_SESSION_RENEW_SECONDS = None  # type: ignore[assignment]
+    hash_password = None  # type: ignore[assignment]
     ACTION_MESSAGE_SIZE = None  # type: ignore[assignment]
     worker_name = None  # type: ignore[assignment]
 
@@ -268,6 +271,34 @@ class TestHttpApi(unittest.TestCase):
         self.assertEqual(body["version"], WORKER_VERSION)
         self.assertTrue(isinstance(body.get("duration"), (int, float)))
 
+    def test_version_query_skips_the_password_check(self):
+        calls, patcher = self._count_password_checks()
+        with patcher:
+            for password in (self.password, "wrong password"):
+                response = self.client.post(
+                    "/api/request_version",
+                    json=self._payload(password=password, new_session=False),
+                )
+                self.assertEqual(response.status_code, 200)
+                body = response.json()
+                self.assertEqual(body["version"], WORKER_VERSION)
+                self.assertNotIn("session_token", body)
+        self.assertEqual(calls, [])
+        self.assertEqual(self._session_count(), 0)
+
+    def test_version_query_is_answered_when_kdf_is_busy(self):
+        from fishtest.password_hash import PasswordHashBusy
+
+        with patch.object(
+            self.rundb.userdb, "password_is_correct", side_effect=PasswordHashBusy
+        ):
+            response = self.client.post(
+                "/api/request_version",
+                json=self._payload(password=self.password, new_session=False),
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["version"], WORKER_VERSION)
+
     def test_request_version_wrong_password(self):
         response = self.client.post(
             "/api/request_version",
@@ -378,13 +409,32 @@ class TestHttpApi(unittest.TestCase):
         self.assertNotIn("session_token", response.json())
         self.assertEqual(self._session_count(), 0)
 
-    def test_password_is_accepted_without_a_session(self):
-        response = self.client.post(
+    def test_password_is_refused_outside_request_version(self):
+        endpoints = [
             "/api/request_task",
-            json=self._payload(password=self.password, new_session=False),
-        )
-        self.assertEqual(response.status_code, 200)
-        self.assertNotIn("error", response.json())
+            "/api/update_task",
+            "/api/beat",
+            "/api/request_spsa",
+            "/api/failed_task",
+            "/api/stop_run",
+            "/api/upload_pgn",
+            "/api/worker_log",
+            "/api/worker_logout",
+        ]
+        calls, patcher = self._count_password_checks()
+        with patcher:
+            for path in endpoints:
+                response = self.client.post(
+                    path, json=self._payload(password=self.password)
+                )
+                body = self._assert_worker_error_response(
+                    response,
+                    status_code=401,
+                    path=path,
+                    contains="please update your worker",
+                )
+                self.assertNotIn("session_token", body)
+        self.assertEqual(calls, [])
         self.assertEqual(self._session_count(), 0)
 
     def test_empty_session_token_is_rejected(self):
@@ -448,6 +498,44 @@ class TestHttpApi(unittest.TestCase):
             contains="Invalid or expired session",
         )
 
+    def test_password_login_reads_the_current_password(self):
+        self._login()
+        userdb = self.rundb.userdb
+        self.assertIsNotNone(userdb.get_user(self.username))
+        # Another process changes the password; this one still caches the old.
+        userdb.users.update_one(
+            {"username": self.username},
+            {"$set": {"password": hash_password("AnotherPassword9!")}},
+        )
+        try:
+            response = self.client.post(
+                "/api/request_version",
+                json=self._payload(password=self.password),
+            )
+            self._assert_worker_error_response(
+                response,
+                status_code=401,
+                path="/api/request_version",
+                contains="Invalid username or password",
+            )
+        finally:
+            userdb.users.update_one(
+                {"username": self.username},
+                {"$set": {"password": hash_password(self.password)}},
+            )
+            userdb.clear_cache()
+
+    def test_session_auth_skips_password_check(self):
+        session_token = self._login()
+        calls, patcher = self._count_password_checks()
+        with patcher:
+            response = self.client.post(
+                "/api/request_task",
+                json=self._session_payload(session_token=session_token),
+            )
+        self.assertNotIn("error", response.json())
+        self.assertEqual(calls, [])
+
     def test_credentials_version_bump_invalidates_session(self):
         session_token = self._login()
         user = self.rundb.userdb.get_user(self.username)
@@ -501,6 +589,35 @@ class TestHttpApi(unittest.TestCase):
             status_code=401,
             path="/api/request_version",
         )
+
+    def _count_password_checks(self):
+        userdb = self.rundb.userdb
+        original = userdb.password_is_correct
+        calls = []
+
+        def counting(username, password):
+            calls.append(username)
+            return original(username, password)
+
+        return calls, patch.object(userdb, "password_is_correct", counting)
+
+    def test_busy_kdf_answers_503_try_again_later(self):
+        from fishtest.password_hash import PasswordHashBusy
+
+        with patch.object(
+            self.rundb.userdb, "password_is_correct", side_effect=PasswordHashBusy
+        ):
+            response = self.client.post(
+                "/api/request_version",
+                json=self._payload(password=self.password),
+            )
+        body = self._assert_worker_error_response(
+            response,
+            status_code=503,
+            path="/api/request_version",
+            contains="try again later",
+        )
+        self.assertNotIn("session_token", body)
 
     def test_worker_endpoints_missing_worker_info_is_validation_error(self):
         endpoints = [

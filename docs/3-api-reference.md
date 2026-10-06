@@ -101,14 +101,16 @@ outside the main loop.
 
 ## Worker authentication
 
-Every worker request carries `worker_info.username` and either a
-`session_token` or the `password`. On `POST /api/request_version`, a valid
-password with `"new_session": true` creates a session. The server stores the
-sha256 digest of the token, and the session stays valid until the worker logs
-out, it is idle for 24 hours, it is 30 days old (29 days for
-`request_version`), or the user changes the password. A rejected session token
-gets HTTP 401; the worker then logs in again with the password. Workers older
-than v330 send the password with every request; the server still accepts it.
+Every worker request carries `worker_info.username` and a `session_token`.
+Only `POST /api/request_version` accepts `password` instead: a valid password
+with `"new_session": true` creates a session. The server stores the sha256
+digest of the token, and the session stays valid until the worker logs out,
+it is idle for 24 hours, it is 30 days old (29 days for `request_version`), or
+the user changes the password. A
+rejected session token gets HTTP 401; the worker then logs in again with the
+password. Workers older than v330, which send the password with every
+request, get HTTP 401 ("please update your worker") on every other endpoint;
+their next `request_version` call makes them update themselves.
 
 ## Worker API paths
 
@@ -131,8 +133,8 @@ to a dedicated backend):
 
 ## Authenticated endpoints
 
-The request bodies carry `session_token` (workers older than v330 send
-`password` instead; see [Worker authentication](#worker-authentication)).
+Apart from `request_version`, the request bodies carry `session_token`
+(see [Worker authentication](#worker-authentication)).
 
 ### POST /api/request_version
 
@@ -149,7 +151,10 @@ to check if they need to upgrade, and to log in for a session.
 ```
 
 Send either `session_token`, or `password` with `"new_session": true` to log
-in. Without `new_session` the password is checked but no session is created.
+in. A request with `password` but without `new_session` is a version query
+from a worker older than v330: it is answered without checking the password,
+so that such a worker always learns that it must update (it quits on any
+error here).
 
 **Response**:
 ```json
